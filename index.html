@@ -1,1 +1,619 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MRMS Precipitation Type Viewer</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --panel: rgba(12, 18, 26, 0.88);
+      --border: rgba(255, 255, 255, 0.14);
+      --muted: #9fb0c3;
+      --accent: #5fd4ff;
+    }
 
+    html,
+    body,
+    #map {
+      height: 100%;
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #06101b;
+    }
+
+    .mrms-frame {
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+
+    .panel {
+      position: absolute;
+      z-index: 1000;
+      top: 1rem;
+      left: 1rem;
+      width: min(420px, calc(100vw - 2rem));
+      color: #f4f7fb;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 18px 55px rgba(0, 0, 0, 0.42);
+      backdrop-filter: blur(10px);
+      overflow: hidden;
+    }
+
+    .panel header {
+      padding: 1rem 1rem 0.75rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .panel h1 {
+      font-size: 1rem;
+      margin: 0 0 0.25rem;
+      letter-spacing: 0.01em;
+    }
+
+    .panel p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.35;
+      font-size: 0.84rem;
+    }
+
+    .controls {
+      display: grid;
+      gap: 0.75rem;
+      padding: 0.9rem 1rem 1rem;
+    }
+
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 0.7rem 1rem;
+      color: #03111c;
+      background: linear-gradient(135deg, #7de6ff, #52ffbd);
+      cursor: pointer;
+      font-weight: 800;
+      letter-spacing: 0.01em;
+    }
+
+    button:disabled {
+      cursor: progress;
+      filter: grayscale(0.5) opacity(0.72);
+    }
+
+    .status {
+      min-height: 2.4rem;
+      padding: 0.65rem 0.75rem;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.06);
+      color: #dbe8f5;
+      font-size: 0.82rem;
+      line-height: 1.35;
+      white-space: pre-wrap;
+    }
+
+    .legend {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.45rem 0.8rem;
+      font-size: 0.78rem;
+      color: #d9e5f0;
+    }
+
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.42rem;
+      min-width: 0;
+    }
+
+    .swatch {
+      width: 0.82rem;
+      height: 0.82rem;
+      border-radius: 3px;
+      border: 1px solid rgba(255, 255, 255, 0.5);
+      flex: 0 0 auto;
+    }
+
+    .note {
+      color: var(--muted);
+      font-size: 0.76rem;
+    }
+
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div id="map" aria-label="Interactive MRMS precipitation type map"></div>
+  <section class="panel" aria-live="polite">
+    <header>
+      <h1>MRMS Precipitation Type Viewer</h1>
+      <p>Loads one latest MRMS precipitation-rate frame, tries RAP/HRRR categorical precipitation type first, and falls back to MRMS PrecipFlag.</p>
+    </header>
+    <div class="controls">
+      <button id="loadFrame">Load latest frame</button>
+      <div id="status" class="status">Ready. Click “Load latest frame” to fetch and decode one frame.</div>
+      <div class="legend" id="legend"></div>
+      <div class="note">Previous overlays are removed before a new frame is added. Browser image smoothing is disabled; a small data-space smoother is applied during decode.</div>
+    </div>
+  </section>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js" crossorigin="anonymous"></script>
+  <script>
+    const SOURCES = {
+      mrmsBucket: 'https://noaa-mrms-pds.s3.amazonaws.com',
+      mrmsMirror: 'https://mrms.ncep.noaa.gov/2D',
+      hrrrBase: 'https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/v4.1',
+      rapBase: 'https://nomads.ncep.noaa.gov/pub/data/nccf/com/rap/v5.1'
+    };
+
+    const PRODUCT_URLS = {
+      precipRate: [
+        `${SOURCES.mrmsBucket}/CONUS/PrecipRate/MRMS_PrecipRate.latest.grib2.gz`,
+        `${SOURCES.mrmsBucket}/CONUS/PrecipRate/MRMS_PrecipRate_00.00.latest.grib2.gz`,
+        `${SOURCES.mrmsMirror}/PrecipRate/MRMS_PrecipRate.latest.grib2.gz`
+      ],
+      precipFlag: [
+        `${SOURCES.mrmsBucket}/CONUS/PrecipFlag/MRMS_PrecipFlag.latest.grib2.gz`,
+        `${SOURCES.mrmsBucket}/CONUS/PrecipFlag/MRMS_PrecipFlag_00.00.latest.grib2.gz`,
+        `${SOURCES.mrmsMirror}/PrecipFlag/MRMS_PrecipFlag.latest.grib2.gz`
+      ]
+    };
+
+    const TYPE_COLORS = {
+      rain: [37, 190, 83],
+      snow: [76, 164, 255],
+      ice: [233, 88, 255],
+      freezingRain: [255, 82, 135],
+      mixed: [255, 184, 64],
+      unknown: [205, 215, 226]
+    };
+
+    const MRMS_FLAG_MAP = new Map([
+      [0, 'unknown'], [1, 'rain'], [3, 'ice'], [6, 'freezingRain'], [7, 'snow'], [10, 'mixed'],
+      [91, 'rain'], [92, 'snow'], [93, 'freezingRain'], [94, 'ice'], [96, 'mixed']
+    ]);
+
+    const MODEL_TYPE_FIELDS = {
+      rain: ['CRAIN', 'CAT rain'],
+      snow: ['CSNOW', 'CAT snow'],
+      ice: ['CICEP', 'CAT ice'],
+      freezingRain: ['CFRZR', 'CAT freezing rain']
+    };
+
+    let activeOverlay = null;
+    let activeObjectUrl = null;
+    const statusEl = document.querySelector('#status');
+    const loadButton = document.querySelector('#loadFrame');
+    const legendEl = document.querySelector('#legend');
+
+    const map = L.map('map', { preferCanvas: true, zoomControl: true }).setView([39.2, -97.5], 4);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    renderLegend();
+    loadButton.addEventListener('click', () => loadLatestFrame().catch(handleFatal));
+
+    async function loadLatestFrame() {
+      setBusy(true, 'Fetching latest MRMS precipitation rate…');
+      removePreviousFrame();
+
+      const rateFile = await fetchFirstAvailable(PRODUCT_URLS.precipRate, 'MRMS PrecipRate');
+      setBusy(true, `Decoding ${rateFile.url.split('/').pop()}…`);
+      const rateGrid = decodeSingleGrib(await ungzipIfNeeded(rateFile.bytes));
+      const smoothedRate = smoothGrid(rateGrid.values, rateGrid.width, rateGrid.height, 1);
+
+      setBusy(true, 'Trying RAP/HRRR precipitation-type fields…');
+      const typeGrid = await loadModelPrecipType(rateGrid).catch(async (error) => {
+        console.warn('Model precipitation type unavailable; falling back to MRMS PrecipFlag.', error);
+        setBusy(true, 'RAP/HRRR type unavailable; falling back to MRMS PrecipFlag…');
+        const flagFile = await fetchFirstAvailable(PRODUCT_URLS.precipFlag, 'MRMS PrecipFlag');
+        const flagGrid = decodeSingleGrib(await ungzipIfNeeded(flagFile.bytes));
+        return classifyMrmsFlags(flagGrid, rateGrid);
+      });
+
+      setBusy(true, 'Rendering one interactable-map frame…');
+      const frame = renderPrecipCanvas(rateGrid, smoothedRate, typeGrid);
+      activeObjectUrl = await canvasToObjectUrl(frame.canvas);
+      activeOverlay = L.imageOverlay(activeObjectUrl, frame.bounds, {
+        opacity: 0.82,
+        className: 'mrms-frame',
+        interactive: false
+      }).addTo(map);
+      map.fitBounds(frame.bounds, { padding: [12, 12], maxZoom: 6 });
+
+      const stamp = extractTimestamp(rateFile.url) || 'latest';
+      setBusy(false, `Displayed ${stamp}.\nRate source: ${rateFile.url}\nType source: ${typeGrid.source}`);
+    }
+
+    function removePreviousFrame() {
+      if (activeOverlay) {
+        map.removeLayer(activeOverlay);
+        activeOverlay = null;
+      }
+      if (activeObjectUrl) {
+        URL.revokeObjectURL(activeObjectUrl);
+        activeObjectUrl = null;
+      }
+    }
+
+    async function fetchFirstAvailable(urls, label) {
+      const errors = [];
+      for (const url of urls) {
+        try {
+          const response = await fetch(url, { cache: 'no-store' });
+          if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+          return { url, bytes: new Uint8Array(await response.arrayBuffer()) };
+        } catch (error) {
+          errors.push(`${url}: ${error.message}`);
+        }
+      }
+      throw new Error(`${label} could not be fetched. ${errors.join(' | ')}`);
+    }
+
+    async function ungzipIfNeeded(bytes) {
+      if (bytes[0] === 0x1f && bytes[1] === 0x8b) return pako.ungzip(bytes);
+      return bytes;
+    }
+
+    async function loadModelPrecipType(targetGrid) {
+      const today = new Date();
+      const dates = [today, new Date(today.getTime() - 86400000)].map((date) => yyyymmdd(date));
+      const cycles = [...Array(24).keys()].reverse().map((hour) => String(hour).padStart(2, '0'));
+      const modelAttempts = [
+        { name: 'HRRR', base: SOURCES.hrrrBase, path: (date, cycle) => `hrrr.${date}/conus/hrrr.t${cycle}z.wrfsfcf00.grib2` },
+        { name: 'RAP', base: SOURCES.rapBase, path: (date, cycle) => `rap.${date}/rap.t${cycle}z.awp130pgrbf00.grib2` }
+      ];
+
+      for (const model of modelAttempts) {
+        for (const date of dates) {
+          for (const cycle of cycles) {
+            const gribUrl = `${model.base}/${model.path(date, cycle)}`;
+            try {
+              const idx = await fetchIndex(`${gribUrl}.idx`);
+              const decodedFields = {};
+              for (const [typeName, aliases] of Object.entries(MODEL_TYPE_FIELDS)) {
+                const record = findIdxRecord(idx, aliases);
+                if (!record) throw new Error(`${typeName} field missing from index`);
+                const bytes = await fetchByteRange(gribUrl, record.start, record.end);
+                decodedFields[typeName] = decodeSingleGrib(bytes);
+              }
+              return classifyModelFields(decodedFields, targetGrid, `${model.name} ${date} ${cycle}z f00`);
+            } catch (error) {
+              console.debug(`${model.name} ${date} ${cycle}z type failed`, error);
+            }
+          }
+        }
+      }
+      throw new Error('No RAP/HRRR precipitation-type fields could be decoded.');
+    }
+
+    async function fetchIndex(url) {
+      const response = await fetch(url, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+      const lines = (await response.text()).trim().split('\n').filter(Boolean);
+      return lines.map((line, index, all) => {
+        const parts = line.split(':');
+        return {
+          raw: line,
+          start: Number(parts[1]),
+          end: index < all.length - 1 ? Number(all[index + 1].split(':')[1]) - 1 : undefined
+        };
+      });
+    }
+
+    function findIdxRecord(records, aliases) {
+      return records.find((record) => aliases.some((alias) => record.raw.toUpperCase().includes(alias.toUpperCase())));
+    }
+
+    async function fetchByteRange(url, start, end) {
+      const headers = end ? { Range: `bytes=${start}-${end}` } : { Range: `bytes=${start}-` };
+      const response = await fetch(url, { headers, cache: 'no-store' });
+      if (!response.ok && response.status !== 206) throw new Error(`${response.status} ${response.statusText}`);
+      return new Uint8Array(await response.arrayBuffer());
+    }
+
+    function decodeSingleGrib(bytes) {
+      const gribOffset = findGribOffset(bytes);
+      if (gribOffset < 0) throw new Error('GRIB marker was not found.');
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const discipline = bytes[gribOffset + 6];
+      const edition = bytes[gribOffset + 7];
+      if (edition !== 2) throw new Error(`Only GRIB2 is supported; found edition ${edition}.`);
+
+      let offset = gribOffset + 16;
+      let grid = null;
+      let bitmap = null;
+      let packing = null;
+      let dataSection = null;
+      while (offset < bytes.length) {
+        if (readAscii(bytes, offset, 4) === '7777') break;
+        const sectionLength = view.getUint32(offset);
+        const sectionNumber = view.getUint8(offset + 4);
+        if (sectionLength <= 0) throw new Error(`Invalid section length at ${offset}.`);
+
+        if (sectionNumber === 3) grid = parseGridDefinition(view, offset);
+        if (sectionNumber === 5) packing = parseDataRepresentation(view, offset);
+        if (sectionNumber === 6) bitmap = parseBitmap(bytes, view, offset);
+        if (sectionNumber === 7) dataSection = { offset: offset + 5, length: sectionLength - 5 };
+        offset += sectionLength;
+      }
+
+      if (!grid || !packing || !dataSection) throw new Error('GRIB2 file is missing grid, packing, or data sections.');
+      if (packing.template !== 0) throw new Error(`Unsupported GRIB2 packing template ${packing.template}. This viewer currently decodes simple packing only.`);
+      const values = unpackSimplePacking(bytes, dataSection, packing, bitmap, grid.points);
+      return { ...grid, values, discipline };
+    }
+
+    function parseGridDefinition(view, offset) {
+      const points = view.getUint32(offset + 6);
+      const template = view.getUint16(offset + 12);
+      if (template !== 0) throw new Error(`Unsupported grid template ${template}; expected regular latitude/longitude grid.`);
+      const earthShape = view.getUint8(offset + 14);
+      const width = view.getUint32(offset + 30);
+      const height = view.getUint32(offset + 34);
+      const lat1 = signedMicroDeg(view.getInt32(offset + 46));
+      const lon1 = readLongitude(view, offset + 50);
+      const lat2 = signedMicroDeg(view.getInt32(offset + 55));
+      const lon2 = readLongitude(view, offset + 59);
+      const iDirection = view.getUint32(offset + 63) / 1e6;
+      const jDirection = view.getUint32(offset + 67) / 1e6;
+      const scanMode = view.getUint8(offset + 71);
+      return { points, template, earthShape, width, height, lat1, lon1, lat2, lon2, iDirection, jDirection, scanMode };
+    }
+
+    function parseDataRepresentation(view, offset) {
+      return {
+        pointCount: view.getUint32(offset + 5),
+        template: view.getUint16(offset + 9),
+        referenceValue: view.getFloat32(offset + 11),
+        binaryScale: view.getInt16(offset + 15),
+        decimalScale: view.getInt16(offset + 17),
+        bitsPerValue: view.getUint8(offset + 19),
+        originalType: view.getUint8(offset + 20)
+      };
+    }
+
+    function parseBitmap(bytes, view, offset) {
+      const indicator = view.getUint8(offset + 5);
+      if (indicator === 255) return null;
+      if (indicator !== 0) throw new Error(`Unsupported bitmap indicator ${indicator}.`);
+      return bytes.subarray(offset + 6, offset + view.getUint32(offset));
+    }
+
+    function unpackSimplePacking(bytes, section, packing, bitmap, pointCount) {
+      const out = new Float32Array(pointCount);
+      out.fill(Number.NaN);
+      const bitReader = new BitReader(bytes, section.offset, section.length);
+      const binaryFactor = Math.pow(2, packing.binaryScale);
+      const decimalFactor = Math.pow(10, -packing.decimalScale);
+      const hasBitmap = Boolean(bitmap);
+      for (let i = 0; i < pointCount; i++) {
+        if (hasBitmap && !bitmapValue(bitmap, i)) continue;
+        const packed = packing.bitsPerValue === 0 ? 0 : bitReader.readBits(packing.bitsPerValue);
+        out[i] = (packing.referenceValue + packed * binaryFactor) * decimalFactor;
+      }
+      return out;
+    }
+
+    class BitReader {
+      constructor(bytes, offset, length) {
+        this.bytes = bytes;
+        this.bitOffset = offset * 8;
+        this.endBit = (offset + length) * 8;
+      }
+
+      readBits(count) {
+        let value = 0;
+        for (let i = 0; i < count; i++) {
+          if (this.bitOffset >= this.endBit) throw new Error('Unexpected end of GRIB2 data section.');
+          const byte = this.bytes[this.bitOffset >> 3];
+          const bit = (byte >> (7 - (this.bitOffset & 7))) & 1;
+          value = (value << 1) | bit;
+          this.bitOffset++;
+        }
+        return value;
+      }
+    }
+
+    function bitmapValue(bitmap, index) {
+      return ((bitmap[index >> 3] >> (7 - (index & 7))) & 1) === 1;
+    }
+
+    function classifyModelFields(fields, targetGrid, source) {
+      const values = new Uint8Array(targetGrid.width * targetGrid.height);
+      for (let y = 0; y < targetGrid.height; y++) {
+        for (let x = 0; x < targetGrid.width; x++) {
+          const latLon = gridCoordinateToLatLon(targetGrid, x, y);
+          let best = 'unknown';
+          let bestValue = 0;
+          for (const [typeName, grid] of Object.entries(fields)) {
+            const value = sampleNearest(grid, latLon.lat, latLon.lon);
+            if (Number.isFinite(value) && value > bestValue) {
+              best = typeName;
+              bestValue = value;
+            }
+          }
+          values[y * targetGrid.width + x] = typeCode(bestValue >= 0.5 ? best : 'unknown');
+        }
+      }
+      return { width: targetGrid.width, height: targetGrid.height, values, source };
+    }
+
+    function classifyMrmsFlags(flagGrid, targetGrid) {
+      const values = new Uint8Array(targetGrid.width * targetGrid.height);
+      for (let y = 0; y < targetGrid.height; y++) {
+        for (let x = 0; x < targetGrid.width; x++) {
+          const latLon = gridCoordinateToLatLon(targetGrid, x, y);
+          const flag = Math.round(sampleNearest(flagGrid, latLon.lat, latLon.lon));
+          values[y * targetGrid.width + x] = typeCode(MRMS_FLAG_MAP.get(flag) || 'unknown');
+        }
+      }
+      return { width: targetGrid.width, height: targetGrid.height, values, source: 'MRMS PrecipFlag fallback' };
+    }
+
+    function renderPrecipCanvas(grid, rates, typeGrid) {
+      const canvas = document.createElement('canvas');
+      canvas.width = grid.width;
+      canvas.height = grid.height;
+      const context = canvas.getContext('2d', { alpha: true });
+      context.imageSmoothingEnabled = false;
+      const image = context.createImageData(grid.width, grid.height);
+      for (let i = 0; i < rates.length; i++) {
+        const rate = rates[i];
+        if (!Number.isFinite(rate) || rate < 0.05) continue;
+        const type = typeName(typeGrid.values[i]);
+        const color = TYPE_COLORS[type] || TYPE_COLORS.unknown;
+        const alpha = Math.max(32, Math.min(235, 52 + Math.log1p(rate) * 92));
+        image.data[i * 4] = color[0];
+        image.data[i * 4 + 1] = color[1];
+        image.data[i * 4 + 2] = color[2];
+        image.data[i * 4 + 3] = alpha;
+      }
+      context.putImageData(image, 0, 0);
+      return { canvas, bounds: gridBounds(grid) };
+    }
+
+    function smoothGrid(values, width, height, passes) {
+      let input = values;
+      let output = new Float32Array(values.length);
+      const weights = [1, 2, 1, 2, 4, 2, 1, 2, 1];
+      const dx = [-1, 0, 1, -1, 0, 1, -1, 0, 1];
+      const dy = [-1, -1, -1, 0, 0, 0, 1, 1, 1];
+      for (let pass = 0; pass < passes; pass++) {
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            let sum = 0;
+            let weightSum = 0;
+            for (let k = 0; k < weights.length; k++) {
+              const xx = x + dx[k];
+              const yy = y + dy[k];
+              if (xx < 0 || xx >= width || yy < 0 || yy >= height) continue;
+              const value = input[yy * width + xx];
+              if (!Number.isFinite(value) || value < 0) continue;
+              sum += value * weights[k];
+              weightSum += weights[k];
+            }
+            output[y * width + x] = weightSum ? sum / weightSum : Number.NaN;
+          }
+        }
+        if (pass < passes - 1) {
+          input = output;
+          output = new Float32Array(values.length);
+        }
+      }
+      return output;
+    }
+
+    function gridCoordinateToLatLon(grid, x, y) {
+      const iScansPositive = (grid.scanMode & 0x80) === 0;
+      const jScansPositive = (grid.scanMode & 0x40) !== 0;
+      const lon = normalizeLon(grid.lon1 + (iScansPositive ? x : -x) * grid.iDirection);
+      const lat = grid.lat1 + (jScansPositive ? y : -y) * grid.jDirection;
+      return { lat, lon };
+    }
+
+    function sampleNearest(grid, lat, lon) {
+      const lonDelta = shortestLonDelta(lon, grid.lon1);
+      const latDelta = lat - grid.lat1;
+      const iScansPositive = (grid.scanMode & 0x80) === 0;
+      const jScansPositive = (grid.scanMode & 0x40) !== 0;
+      const x = Math.round((iScansPositive ? lonDelta : -lonDelta) / grid.iDirection);
+      const y = Math.round((jScansPositive ? latDelta : -latDelta) / grid.jDirection);
+      if (x < 0 || x >= grid.width || y < 0 || y >= grid.height) return Number.NaN;
+      return grid.values[y * grid.width + x];
+    }
+
+    function gridBounds(grid) {
+      const corners = [
+        gridCoordinateToLatLon(grid, 0, 0),
+        gridCoordinateToLatLon(grid, grid.width - 1, 0),
+        gridCoordinateToLatLon(grid, 0, grid.height - 1),
+        gridCoordinateToLatLon(grid, grid.width - 1, grid.height - 1)
+      ];
+      const lats = corners.map((corner) => corner.lat);
+      const lons = corners.map((corner) => corner.lon);
+      return [[Math.min(...lats), Math.min(...lons)], [Math.max(...lats), Math.max(...lons)]];
+    }
+
+    function typeCode(name) {
+      return ['unknown', 'rain', 'snow', 'ice', 'freezingRain', 'mixed'].indexOf(name);
+    }
+
+    function typeName(code) {
+      return ['unknown', 'rain', 'snow', 'ice', 'freezingRain', 'mixed'][code] || 'unknown';
+    }
+
+    function renderLegend() {
+      const labels = { rain: 'Rain', snow: 'Snow', ice: 'Ice pellets', freezingRain: 'Freezing rain', mixed: 'Mixed', unknown: 'Unknown' };
+      legendEl.innerHTML = Object.entries(labels).map(([key, label]) => {
+        const [r, g, b] = TYPE_COLORS[key];
+        return `<span><i class="swatch" style="background: rgb(${r}, ${g}, ${b})"></i>${label}</span>`;
+      }).join('');
+    }
+
+    async function canvasToObjectUrl(canvas) {
+      return new Promise((resolve) => canvas.toBlob((blob) => resolve(URL.createObjectURL(blob)), 'image/png'));
+    }
+
+    function setBusy(isBusy, message) {
+      loadButton.disabled = isBusy;
+      statusEl.textContent = message;
+    }
+
+    function handleFatal(error) {
+      console.error(error);
+      setBusy(false, `Unable to render frame: ${error.message}`);
+    }
+
+    function findGribOffset(bytes) {
+      for (let i = 0; i < bytes.length - 3; i++) {
+        if (bytes[i] === 0x47 && bytes[i + 1] === 0x52 && bytes[i + 2] === 0x49 && bytes[i + 3] === 0x42) return i;
+      }
+      return -1;
+    }
+
+    function readAscii(bytes, offset, length) {
+      return String.fromCharCode(...bytes.subarray(offset, offset + length));
+    }
+
+    function signedMicroDeg(value) {
+      return value / 1e6;
+    }
+
+    function readLongitude(view, offset) {
+      const unsigned = view.getUint32(offset);
+      if (unsigned <= 360000000) return normalizeLon(unsigned / 1e6);
+      return normalizeLon(view.getInt32(offset) / 1e6);
+    }
+
+    function normalizeLon(lon) {
+      let normalized = lon > 180 ? lon - 360 : lon;
+      while (normalized < -180) normalized += 360;
+      while (normalized > 180) normalized -= 360;
+      return normalized;
+    }
+
+    function shortestLonDelta(lon, origin) {
+      let delta = normalizeLon(lon) - normalizeLon(origin);
+      if (delta > 180) delta -= 360;
+      if (delta < -180) delta += 360;
+      return delta;
+    }
+
+    function yyyymmdd(date) {
+      return `${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, '0')}${String(date.getUTCDate()).padStart(2, '0')}`;
+    }
+
+    function extractTimestamp(url) {
+      const match = url.match(/_(\d{8}-\d{6})\.grib2/) || url.match(/(latest)/i);
+      return match ? match[1] : null;
+    }
+  </script>
+</body>
+</html>
