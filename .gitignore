@@ -1,0 +1,9 @@
+frames/*.png
+__pycache__/
+*.pyc
+*.pyo
+.cfgrib/
+*.grib2.idx
+*.idx
+*.cache
+.env

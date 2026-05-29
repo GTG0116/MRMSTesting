@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>MRMS Precipitation Viewer</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: #111;
+      color: #eee;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Header ─────────────────────────────────── */
+    #header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 14px;
+      background: #1a1a2e;
+      border-bottom: 1px solid #333;
+      flex-shrink: 0;
+    }
+    #header h1 { font-size: 1rem; font-weight: 600; letter-spacing: .5px; }
+    #status-badge {
+      font-size: .75rem;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: #333;
+      color: #ccc;
+    }
+    #status-badge.ready   { background: #1b4d1b; color: #7cfc7c; }
+    #status-badge.loading { background: #4a3000; color: #ffc96e; }
+    #status-badge.error   { background: #5a0000; color: #ff8080; }
+
+    #btn-refresh {
+      margin-left: auto;
+      padding: 5px 14px;
+      border: none;
+      border-radius: 4px;
+      background: #2563eb;
+      color: #fff;
+      cursor: pointer;
+      font-size: .8rem;
+      transition: background .15s;
+    }
+    #btn-refresh:hover  { background: #1d4ed8; }
+    #btn-refresh:active { background: #1e40af; }
+    #btn-refresh:disabled { background: #444; cursor: not-allowed; }
+
+    /* ── Map ─────────────────────────────────────── */
+    #map {
+      flex: 1;
+      width: 100%;
+    }
+
+    /* No browser smoothing on the overlay image — smoothing is baked in */
+    .mrms-overlay {
+      image-rendering: -webkit-optimize-contrast;
+      image-rendering: crisp-edges;
+      image-rendering: pixelated;
+    }
+
+    /* ── Footer / info bar ──────────────────────── */
+    #footer {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 5px 14px;
+      background: #1a1a2e;
+      border-top: 1px solid #333;
+      font-size: .72rem;
+      color: #999;
+      flex-shrink: 0;
+    }
+    #footer span b { color: #ccc; }
+
+    /* ── Legend ──────────────────────────────────── */
+    .legend {
+      line-height: 1.5;
+      font-size: .72rem;
+    }
+    .legend-title {
+      font-weight: bold;
+      font-size: .78rem;
+      margin-bottom: 4px;
+      color: #eee;
+    }
+    .legend-row {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      margin-bottom: 2px;
+    }
+    .legend-swatch {
+      width: 16px;
+      height: 10px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+    .legend-section {
+      margin-top: 6px;
+      border-top: 1px solid #aaa;
+      padding-top: 4px;
+    }
+    .legend-type {
+      font-weight: 600;
+      color: #ddd;
+      font-size: .7rem;
+      margin-bottom: 2px;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<div id="header">
+  <h1>MRMS Precipitation Viewer</h1>
+  <span id="status-badge">Initialising…</span>
+  <button id="btn-refresh">↺ Refresh</button>
+</div>
+
+<!-- Map -->
+<div id="map"></div>
+
+<!-- Footer info bar -->
+<div id="footer">
+  <span>Valid: <b id="info-time">—</b></span>
+  <span>Precip type source: <b id="info-source">—</b></span>
+  <span>Max rate: <b id="info-max">—</b></span>
+  <span style="margin-left:auto; color:#555">
+    MRMS CONUS PrecipRate • nowCOAST-style smoothing
+  </span>
+</div>
+
+<script>
+// ─── Map init ──────────────────────────────────────────────────────────────
+const map = L.map('map', {
+  center: [38, -96],
+  zoom: 4,
+  zoomControl: true,
+});
+
+// Base tile layer (dark style)
+L.tileLayer(
+  'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+  {
+    attribution: '&copy; <a href="https://carto.com/">CARTO</a> &copy; OpenStreetMap contributors',
+    subdomains: 'abcd',
+    maxZoom: 19,
+  }
+).addTo(map);
+
+// ─── MRMS overlay ──────────────────────────────────────────────────────────
+let mrmsOverlay = null;
+
+function applyFrame(metadata) {
+  const bounds = L.latLngBounds(metadata.bounds[0], metadata.bounds[1]);
+
+  if (mrmsOverlay) {
+    // Update image source in-place to avoid flicker
+    mrmsOverlay.setUrl('/api/frame.png?' + Date.now());
+    mrmsOverlay.setBounds(bounds);
+  } else {
+    mrmsOverlay = L.imageOverlay('/api/frame.png?' + Date.now(), bounds, {
+      opacity: 0.80,
+      className: 'mrms-overlay',   // disables browser image smoothing
+      interactive: false,
+    }).addTo(map);
+  }
+
+  // Update footer
+  const ts = metadata.timestamp || '';
+  const y=ts.slice(0,4), mo=ts.slice(4,6), d=ts.slice(6,8),
+        h=ts.slice(9,11), mi=ts.slice(11,13), s=ts.slice(13,15);
+  document.getElementById('info-time').textContent =
+    `${y}-${mo}-${d} ${h}:${mi}:${s} UTC`;
+  document.getElementById('info-source').textContent =
+    metadata.ptype_source || '—';
+  document.getElementById('info-max').textContent =
+    metadata.max_rate != null ? metadata.max_rate.toFixed(1) + ' mm/hr' : '—';
+}
+
+// ─── Polling / refresh logic ────────────────────────────────────────────────
+const badge  = document.getElementById('status-badge');
+const btnRef = document.getElementById('btn-refresh');
+
+function setBadge(state, text) {
+  badge.className = 'status-badge ' + state;
+  badge.textContent = text;
+}
+
+let pollTimer = null;
+
+function pollStatus() {
+  fetch('/api/frame-info')
+    .then(r => r.json())
+    .then(info => {
+      if (info.processing) {
+        setBadge('loading', 'Processing…');
+        pollTimer = setTimeout(pollStatus, 2000);
+        return;
+      }
+      if (info.error) {
+        setBadge('error', 'Error – see console');
+        console.error('Frame error:', info.error);
+        btnRef.disabled = false;
+        return;
+      }
+      if (info.frame_ready && info.metadata) {
+        applyFrame(info.metadata);
+        const ts = info.updated_at || '';
+        setBadge('ready', 'Ready ' + ts.replace('_', ' ') + 'Z');
+        btnRef.disabled = false;
+      } else {
+        // Still waiting for first frame
+        pollTimer = setTimeout(pollStatus, 2000);
+      }
+    })
+    .catch(err => {
+      console.error('Poll error:', err);
+      pollTimer = setTimeout(pollStatus, 5000);
+    });
+}
+
+btnRef.addEventListener('click', () => {
+  btnRef.disabled = true;
+  setBadge('loading', 'Fetching…');
+  clearTimeout(pollTimer);
+
+  fetch('/api/refresh', { method: 'POST' })
+    .then(() => { pollTimer = setTimeout(pollStatus, 3000); })
+    .catch(err => {
+      console.error(err);
+      setBadge('error', 'Refresh failed');
+      btnRef.disabled = false;
+    });
+});
+
+// ─── Legend ────────────────────────────────────────────────────────────────
+const legend = L.control({ position: 'bottomright' });
+legend.onAdd = () => {
+  const div = L.DomUtil.create('div', 'leaflet-bar legend');
+  div.style.cssText = 'background:rgba(20,20,30,.88);padding:8px 10px;'
+    + 'border-radius:6px;color:#ddd;min-width:140px;';
+  div.innerHTML = `
+    <div class="legend-title">Precip Rate</div>
+
+    <div class="legend-type">Rain (mm/hr)</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:#04E9E7"></span>0.1 – 0.5</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:#019FF4"></span>0.5 – 1.0</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:#02FD02"></span>1.0 – 4.0</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:#FDF802"></span>10 – 20</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:#FD9500"></span>20 – 30</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:#FD0000"></span>30 – 45</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:#BC00FD"></span>&gt; 60</div>
+
+    <div class="legend-section">
+      <div class="legend-type">Snow</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#BDE1FF"></span>light</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#0090FF"></span>moderate</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#0000A8"></span>heavy</div>
+    </div>
+
+    <div class="legend-section">
+      <div class="legend-type">Freezing Rain</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#FFB7FF"></span>light</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#FF00FF"></span>moderate+</div>
+    </div>
+
+    <div class="legend-section">
+      <div class="legend-type">Ice Pellets</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#D2B4FF"></span>light</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#8C00FF"></span>heavy</div>
+    </div>
+  `;
+  // prevent map click-through on legend
+  L.DomEvent.disableClickPropagation(div);
+  L.DomEvent.disableScrollPropagation(div);
+  return div;
+};
+legend.addTo(map);
+
+// ─── Opacity slider ─────────────────────────────────────────────────────────
+const opacityCtrl = L.control({ position: 'bottomleft' });
+opacityCtrl.onAdd = () => {
+  const div = L.DomUtil.create('div', 'leaflet-bar');
+  div.style.cssText = 'background:rgba(20,20,30,.88);padding:6px 10px;'
+    + 'border-radius:6px;color:#ccc;font-size:.72rem;display:flex;align-items:center;gap:8px;';
+  div.innerHTML = `
+    <span>Opacity</span>
+    <input id="opacity-slider" type="range" min="0" max="100" value="80"
+      style="width:90px;accent-color:#2563eb;" />
+    <span id="opacity-val">80%</span>
+  `;
+  L.DomEvent.disableClickPropagation(div);
+  L.DomEvent.disableScrollPropagation(div);
+  return div;
+};
+opacityCtrl.addTo(map);
+
+document.addEventListener('input', e => {
+  if (e.target.id !== 'opacity-slider') return;
+  const val = +e.target.value / 100;
+  document.getElementById('opacity-val').textContent = e.target.value + '%';
+  if (mrmsOverlay) mrmsOverlay.setOpacity(val);
+});
+
+// ─── Kick off initial poll ───────────────────────────────────────────────────
+setBadge('loading', 'Fetching…');
+pollTimer = setTimeout(pollStatus, 2000);
+</script>
+</body>
+</html>
