@@ -210,7 +210,7 @@ SINGLE_PRODUCTS = {
 # --- HRRR PRECIP TYPE (model-based, avoids radar artefacts) ---
 HRRR_BUCKET = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com"
 
-_hrrr_cache = {}  # cache key: YYYYMMDDHH string
+_hrrr_cache = {}  # key: YYYYMMDDHH → (result_dict | None, reason_str | None)
 
 def _fetch_hrrr_vars_s3(date_str, hour_str, hours_back):
     import cfgrib  # noqa: F401
@@ -262,20 +262,24 @@ def _fetch_hrrr_vars_s3(date_str, hour_str, hours_back):
 
 
 def get_hrrr_precip_type(target_dt, tgt_lats_2d, tgt_lons_2d):
+    """Returns (result_dict, None) on success, or (None, reason_str) on failure."""
     try:
         from scipy.spatial import cKDTree
     except ImportError:
-        return None
+        return None, "scipy not installed"
 
     hrrr_hour_dt = target_dt.replace(minute=0, second=0, microsecond=0)
     cache_key = hrrr_hour_dt.strftime('%Y%m%d%H')
     if cache_key in _hrrr_cache:
         return _hrrr_cache[cache_key]
 
+    attempt_errors = []
     for hours_back in range(3):
         run_dt   = hrrr_hour_dt - timedelta(hours=hours_back)
         date_str = run_dt.strftime('%Y%m%d')
         hour_str = run_dt.strftime('%H')
+        fhr      = max(1, hours_back)
+        label    = f"t-{hours_back}h ({hour_str}z fhr={fhr:02d})"
 
         fname  = None
         all_ds = []
@@ -298,6 +302,10 @@ def get_hrrr_precip_type(target_dt, tgt_lats_2d, tgt_lons_2d):
                         hrrr_lon = ds[lon_k].values
 
             if hrrr_lat is None or not vmap:
+                msg = (f"{label}: cfgrib returned no usable datasets "
+                       f"(vars found: {list(vmap)})")
+                attempt_errors.append(msg)
+                print(f"  HRRR {msg}")
                 continue
 
             # HRRR GRIB2 stores longitudes in 0-360; normalize to -180/180
@@ -332,15 +340,16 @@ def get_hrrr_precip_type(target_dt, tgt_lats_2d, tgt_lons_2d):
             if fname and os.path.exists(fname):
                 os.remove(fname)
 
-            fhr_used = max(1, hours_back)
             n_typed = int(np.sum(result['rain'] | result['snow'] | result['ice']))
-            print(f"  HRRR precip type (S3): {hour_str}z fhr={fhr_used:02d} "
-                  f"({n_typed} typed px)")
-            _hrrr_cache[cache_key] = result
-            return result
+            print(f"  HRRR precip type OK: {label} ({n_typed} typed px)")
+            ret = (result, None)
+            _hrrr_cache[cache_key] = ret
+            return ret
 
         except Exception as e:
-            print(f"  HRRR S3 t-{hours_back}h failed: {e}")
+            msg = f"{label}: {e}"
+            attempt_errors.append(msg)
+            print(f"  HRRR attempt failed — {msg}")
             for ds in all_ds:
                 try:
                     ds.close()
@@ -349,9 +358,10 @@ def get_hrrr_precip_type(target_dt, tgt_lats_2d, tgt_lons_2d):
             if fname and os.path.exists(fname):
                 os.remove(fname)
 
-    print("  HRRR unavailable — using MRMS PrecipFlag + safeguards")
-    _hrrr_cache[cache_key] = None
-    return None
+    reason = " | ".join(attempt_errors) if attempt_errors else "all 3 attempts failed (no detail)"
+    ret = (None, reason)
+    _hrrr_cache[cache_key] = ret
+    return ret
 
 # ---------------------------------------------------------------------------
 
@@ -435,71 +445,60 @@ def process_frame(rate_key, flag_keys):
     time_prefix    = timestamp_part[:13]
     flag_key       = next((k for k in flag_keys if time_prefix in k), None)
 
-    if not flag_key:
-        print(f"  Skipping {time_prefix}: no matching flag file.")
-        return
-
-    tmp_r, tmp_f = "rate_0.grib2", "flag_0.grib2"
+    tmp_r, tmp_f = "rate_0.grib2", None
 
     try:
         if not download_and_extract(rate_key, tmp_r):
             return
-        if not download_and_extract(flag_key, tmp_f):
-            return
 
         ds_rate = xr.open_dataset(tmp_r, engine="cfgrib", backend_kwargs={'indexpath': ''})
-        ds_flag = xr.open_dataset(tmp_f, engine="cfgrib", backend_kwargs={'indexpath': ''})
-
-        for ds in [ds_rate, ds_flag]:
-            ds.coords['longitude'] = ((ds.longitude + 180) % 360) - 180
+        ds_rate.coords['longitude'] = ((ds_rate.longitude + 180) % 360) - 180
         ds_rate = ds_rate.sortby("latitude", ascending=False).sortby("longitude", ascending=True)
-        ds_flag = ds_flag.sortby("latitude", ascending=False).sortby("longitude", ascending=True)
 
         width_px, height_px, target_lats, target_lons = _get_mercator_grid()
 
-        r_warp = ds_rate[list(ds_rate.data_vars)[0]].interp(
+        r_warp    = ds_rate[list(ds_rate.data_vars)[0]].interp(
             latitude=target_lats, longitude=target_lons, method="nearest")
-        f_warp = ds_flag[list(ds_flag.data_vars)[0]].interp(
-            latitude=target_lats, longitude=target_lons, method="nearest")
-
         rate_vals = r_warp.values
-        flag_vals = f_warp.values
 
         utc_dt = _parse_valid_time(ds_rate, rate_key)
         tgt_lons_2d, tgt_lats_2d = np.meshgrid(target_lons, target_lats)
 
-        hrrr = get_hrrr_precip_type(utc_dt, tgt_lats_2d, tgt_lons_2d)
+        hrrr, hrrr_reason = get_hrrr_precip_type(utc_dt, tgt_lats_2d, tgt_lons_2d)
 
         if hrrr is not None:
-            has_precip = rate_vals > 0.1
-
-            rain_mask = hrrr['rain'] & has_precip
-            snow_mask = hrrr['snow'] & has_precip & ~hrrr['rain']
-            ice_mask  = hrrr['ice']  & has_precip & ~hrrr['rain'] & ~hrrr['snow']
-
-            hrrr_typed = hrrr['rain'] | hrrr['snow'] | hrrr['ice']
-            fallback   = has_precip & ~hrrr_typed
-            if np.any(fallback):
-                rain_mask |= fallback & np.isin(flag_vals, [1, 2, 91, 96])
-                snow_mask |= fallback & np.isin(flag_vals, [3])
-                ice_mask  |= fallback & np.isin(flag_vals, [4, 5, 6])
-                rain_mask |= fallback & np.isin(flag_vals, [7, 10])
-
-            mrms_rain_hail = np.isin(flag_vals, [2]) & has_precip
-            ice_mask  &= ~mrms_rain_hail
-            snow_mask &= ~mrms_rain_hail
-            rain_mask |=  mrms_rain_hail
-
+            has_precip    = rate_vals > 0.1
+            rain_mask     = hrrr['rain'] & has_precip
+            snow_mask     = hrrr['snow'] & has_precip & ~hrrr['rain']
+            ice_mask      = hrrr['ice']  & has_precip & ~hrrr['rain'] & ~hrrr['snow']
             still_untyped = has_precip & ~(rain_mask | snow_mask | ice_mask)
-            rain_mask |= still_untyped
+            rain_mask    |= still_untyped
 
         else:
-            has_precip = rate_vals > 0.1
-            rain_mask = np.isin(flag_vals, [1, 2, 91, 96])
-            snow_mask = np.isin(flag_vals, [3])
-            ice_mask  = np.isin(flag_vals, [4, 5, 6])
+            print(f"  HRRR failed — reason: {hrrr_reason}")
+            if not flag_key:
+                print(f"  Skipping {time_prefix}: no HRRR and no matching PrecipFlag file.")
+                return
+
+            print(f"  Falling back to MRMS PrecipFlag.")
+            tmp_f = "flag_0.grib2"
+            if not download_and_extract(flag_key, tmp_f):
+                return
+
+            ds_flag = xr.open_dataset(tmp_f, engine="cfgrib", backend_kwargs={'indexpath': ''})
+            ds_flag.coords['longitude'] = ((ds_flag.longitude + 180) % 360) - 180
+            ds_flag = ds_flag.sortby("latitude", ascending=False).sortby("longitude", ascending=True)
+            f_warp    = ds_flag[list(ds_flag.data_vars)[0]].interp(
+                latitude=target_lats, longitude=target_lons, method="nearest")
+            flag_vals = f_warp.values
+            ds_flag.close()
+
+            has_precip        = rate_vals > 0.1
+            rain_mask         = np.isin(flag_vals, [1, 2, 91, 96])
+            snow_mask         = np.isin(flag_vals, [3])
+            ice_mask          = np.isin(flag_vals, [4, 5, 6])
             untyped_with_rate = has_precip & np.isin(flag_vals, [7, 10])
-            rain_mask |= untyped_with_rate
+            rain_mask        |= untyped_with_rate
 
         high_rate  = rate_vals > WINTRY_RATE_MAX  # threshold in mm/hr (raw data)
         rain_mask |= (snow_mask | ice_mask) & high_rate
@@ -543,14 +542,13 @@ def process_frame(rate_key, flag_keys):
         print(f"  Precip rate frame 0 saved: {meta['time']} ({width_px}x{height_px})")
 
         ds_rate.close()
-        ds_flag.close()
         gc.collect()
 
     except Exception as e:
         print(f"  Error on precip rate frame: {e}")
     finally:
         for f in [tmp_r, tmp_f]:
-            if os.path.exists(f):
+            if f and os.path.exists(f):
                 os.remove(f)
 
 
