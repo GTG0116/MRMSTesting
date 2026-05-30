@@ -1,0 +1,71 @@
+name: Update Weather Data
+
+on:
+  workflow_dispatch:      # Allows manual/external triggers
+  repository_dispatch:    # Allows API triggers
+    types: [update_radar]
+  schedule:
+    - cron: '*/15 * * * *' # Keep this as a backup
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeccodes-dev
+
+      - name: Install Python Dependencies
+        run: |
+          pip install numpy xarray cfgrib matplotlib requests beautifulsoup4 pillow scipy
+
+      - name: Rotate Frames
+        run: |
+          mkdir -p public/data
+
+          # --- Precipitation rate (master.png naming) ---
+          # Shift frames 13→14 down to 1→2, then master.png→master_1.png.
+          # Frame 14 (oldest) is overwritten/dropped to keep max NUM_FRAMES=15.
+          for i in $(seq 13 -1 1); do
+            next=$((i+1))
+            [ -f "public/data/master_${i}.png" ]      && mv "public/data/master_${i}.png"      "public/data/master_${next}.png"      || true
+            [ -f "public/data/metadata_${i}.json" ]   && mv "public/data/metadata_${i}.json"   "public/data/metadata_${next}.json"   || true
+          done
+          [ -f "public/data/master.png" ]       && mv "public/data/master.png"       "public/data/master_1.png"     || true
+          [ -f "public/data/metadata_0.json" ]  && mv "public/data/metadata_0.json"  "public/data/metadata_1.json"  || true
+
+          # --- Single-field products: mesh, qpe6h, qpe24h, refl, lightning, rotation ---
+          # Shift frames 13→14 down to 0→1 for each product.
+          for product in mesh qpe6h qpe24h refl lightning rotation; do
+            for i in $(seq 13 -1 0); do
+              next=$((i+1))
+              [ -f "public/data/${product}_${i}.png" ]             && mv "public/data/${product}_${i}.png"             "public/data/${product}_${next}.png"             || true
+              [ -f "public/data/metadata_${product}_${i}.json" ]   && mv "public/data/metadata_${product}_${i}.json"   "public/data/metadata_${product}_${next}.json"   || true
+              [ -f "public/data/${product}_val_${i}.png" ]         && mv "public/data/${product}_val_${i}.png"         "public/data/${product}_val_${next}.png"         || true
+            done
+          done
+
+      - name: Run Processing Script
+        run: python scripts/process_mrms.py
+
+      - name: Commit and Push
+        run: |
+          git config --global user.name "weather-bot"
+          git config --global user.email "bot@weather.com"
+          git add public/data/*
+          git commit -m "Update radar: $(date)" || echo "No changes"
+          git push origin main
