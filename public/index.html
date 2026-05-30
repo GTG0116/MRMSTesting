@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Precision MRMS HD | Live</title>
+
+    <script src='https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js'></script>
+    <link href='https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css' rel='stylesheet' />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="icon" href="data:,">
+
+    <style>
+        :root { --bg: rgba(10, 15, 25, 0.95); --accent: #00f2ff; --border: rgba(255, 255, 255, 0.1); }
+        body { margin: 0; padding: 0; background: #010409; color: white; overflow: hidden; font-family: 'Inter', sans-serif; -webkit-tap-highlight-color: transparent; }
+        #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+
+        /* --- LEGEND --- */
+        .legend-container {
+            position: absolute; top: 20px; left: 20px;
+            background: var(--bg); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--border); border-radius: 12px;
+            padding: 12px; z-index: 10; display: flex; flex-direction: column; gap: 10px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+        }
+        .legend-group { display: flex; flex-direction: column; gap: 4px; }
+        .legend-label { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: #888; }
+        .color-strip { display: flex; height: 8px; border-radius: 2px; overflow: hidden; width: 120px; border: 1px solid rgba(255,255,255,0.05); }
+        .color-block { flex: 1; height: 100%; }
+        .legend-scale { display: flex; justify-content: space-between; font-size: 7.5px; color: #aaa; width: 120px; margin-top: 2px; font-family: 'JetBrains Mono', monospace; }
+
+        /* --- UI CARD --- */
+        .ui-card {
+            position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+            width: 92%; max-width: 450px; background: var(--bg);
+            backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--border); border-radius: 20px; padding: 18px; z-index: 10;
+            box-shadow: 0 15px 45px rgba(0,0,0,0.7);
+        }
+
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .logo { font-size: 10px; letter-spacing: 2px; color: var(--accent); text-transform: uppercase; font-weight: 600; }
+        #timestamp { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #aaa; }
+
+        .control-grid { display: grid; grid-template-columns: 48px 1fr; gap: 15px; align-items: center; }
+        #play-btn { width: 48px; height: 48px; border-radius: 12px; border: none; background: var(--accent); color: #000; cursor: pointer; font-size: 18px; }
+
+        .sliders-container { display: flex; flex-direction: column; gap: 12px; }
+        input[type=range] { -webkit-appearance: none; background: transparent; width: 100%; margin: 0; cursor: pointer; }
+        input[type=range]::-webkit-slider-runnable-track { height: 4px; background: rgba(255,255,255,0.15); border-radius: 2px; }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none; height: 18px; width: 18px; border-radius: 50%;
+            background: #fff; border: 2px solid var(--accent); margin-top: -7px;
+        }
+
+        .sub-settings { display: flex; justify-content: space-between; gap: 15px; font-size: 11px; }
+        .setting-group { display: flex; align-items: center; gap: 8px; flex: 1; }
+
+        /* Mapbox GPS Icon customization */
+        .mapboxgl-ctrl-group { background: var(--bg) !important; border: 1px solid var(--border) !important; }
+        .mapboxgl-ctrl-icon { filter: invert(1); }
+
+        /* --- SELECTOR ROWS --- */
+        .selector-row {
+            display: flex; gap: 6px; margin-top: 14px;
+            border-top: 1px solid var(--border); padding-top: 14px;
+        }
+        .selector-btn {
+            flex: 1; padding: 6px 4px; border-radius: 8px; border: 1px solid var(--border);
+            background: rgba(255,255,255,0.05); color: #aaa; cursor: pointer;
+            font-family: 'Inter', sans-serif; font-size: 10px; font-weight: 600;
+            letter-spacing: 0.5px; text-transform: uppercase; text-align: center;
+            transition: background 0.2s, color 0.2s, border-color 0.2s;
+            white-space: nowrap;
+        }
+        .selector-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+        .selector-btn.active {
+            background: rgba(0, 242, 255, 0.15); color: var(--accent);
+            border-color: var(--accent);
+        }
+
+        /* --- PIXEL INSPECTOR --- */
+        .pixel-popup .mapboxgl-popup-content {
+            background: rgba(10, 15, 25, 0.97);
+            border: 1px solid var(--accent);
+            border-radius: 10px;
+            padding: 10px 14px;
+            color: white;
+            font-family: 'Inter', sans-serif;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+            min-width: 110px;
+        }
+        .pixel-popup .mapboxgl-popup-close-button {
+            color: #aaa; font-size: 14px; padding: 4px 8px;
+        }
+        .pixel-popup .mapboxgl-popup-close-button:hover { color: #fff; }
+        .pixel-popup .mapboxgl-popup-tip { border-top-color: var(--accent) !important; }
+        .pixel-popup-content { display: flex; flex-direction: column; gap: 3px; }
+        .pixel-label {
+            font-size: 9px; font-weight: 600; text-transform: uppercase;
+            letter-spacing: 1px; color: #888;
+        }
+        .pixel-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 15px; color: var(--accent); font-weight: 600;
+        }
+        .pixel-nodata { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #555; }
+        .map-inspect { cursor: crosshair !important; }
+    </style>
+</head>
+<body>
+
+    <div id="map"></div>
+
+    <div class="legend-container" id="legend-container">
+        <!-- Populated dynamically -->
+    </div>
+
+    <div class="ui-card">
+        <div class="header">
+            <div class="logo">MRMS • Live HD</div>
+            <div id="timestamp">SYNCING...</div>
+        </div>
+        <div class="control-grid">
+            <button id="play-btn"><i class="fas fa-play"></i></button>
+            <div class="sliders-container">
+                <input type="range" id="time-slider" min="0" max="14" value="14">
+                <div class="sub-settings">
+                    <div class="setting-group"><i class="fas fa-eye"></i><input type="range" id="opacity-slider" min="0" max="1" step="0.1" value="0.7"></div>
+                    <div class="setting-group"><i class="fas fa-bolt"></i><input type="range" id="speed-slider" min="1" max="10" step="1" value="7"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Product selector row 1 -->
+        <div class="selector-row">
+            <button class="selector-btn active" data-product="rate">Precip</button>
+            <button class="selector-btn" data-product="refl">Reflectivity</button>
+            <button class="selector-btn" data-product="mesh">Hail</button>
+            <button class="selector-btn" data-product="qpe6h">6-Hr QPE</button>
+            <button class="selector-btn" data-product="qpe24h">24-Hr QPE</button>
+        </div>
+        <!-- Product selector row 2 -->
+        <div class="selector-row">
+            <button class="selector-btn" data-product="lightning">Lightning</button>
+            <button class="selector-btn" data-product="rotation">Az Shear</button>
+        </div>
+
+        <!-- Map type selector -->
+        <div class="selector-row">
+            <button class="selector-btn" data-maptype="satellite-streets">Satellite</button>
+            <button class="selector-btn" data-maptype="outdoors">Outdoors</button>
+            <button class="selector-btn" data-maptype="streets">Streets</button>
+        </div>
+    </div>
+
+    <script>
+        // --- PRODUCT CONFIG ---
+        const PRODUCTS = {
+            rate: {
+                label: 'Precip Rate',
+                getImgName:  (i) => i === 0 ? 'master.png' : `master_${i}.png`,
+                getMetaName: (i) => `metadata_${i}.json`,
+                legend: [
+                    { label: 'Rain (in/hr)',  colors: ['#00fb90','#00cc00','#009900','#006600','#ffff00','#ffcc00','#ff9100','#ff5500','#ff0000','#cc0000'], scale: ['0.01"','0.20"','1.0"','5.0"'] },
+                    { label: 'Ice/Mix',       colors: ['#ff00ff','#d100d1','#910091','#4b0082','#2d004b'], scale: ['Light','Heavy'] },
+                    { label: 'Snow (in/hr)',  colors: ['#00ffff','#80ffff','#ffffff','#adc5ff','#5a82ff'], scale: ['0.004"','0.10"','0.24"'] },
+                ]
+            },
+            refl: {
+                label: 'Base Reflectivity',
+                getImgName:  (i) => `refl_${i}.png`,
+                getMetaName: (i) => `metadata_refl_${i}.json`,
+                legend: [
+                    { label: 'Reflectivity (dBZ)', colors: ['#646464','#04e9e7','#019ff4','#0300f4','#02fd02','#01c501','#008e00','#fdf802','#e5bc00','#fd9500','#fd0000','#d40000','#bc0000','#f800fd'], scale: ['0','35','55','75'] }
+                ]
+            },
+            mesh: {
+                label: 'Hail Size (MESH)',
+                getImgName:  (i) => `mesh_${i}.png`,
+                getMetaName: (i) => `metadata_mesh_${i}.json`,
+                legend: [
+                    { label: 'Hail Diameter (in)', colors: ['#c8f500','#ffff00','#ffd700','#ff8c00','#ff4500','#ff0000','#cc0000','#7f0000'], scale: ['0.25" Pea','0.75"','1.75" Golf','3.0" Baseball'] }
+                ]
+            },
+            qpe6h: {
+                label: '6-Hr Precip',
+                getImgName:  (i) => `qpe6h_${i}.png`,
+                getMetaName: (i) => `metadata_qpe6h_${i}.json`,
+                legend: [
+                    { label: '6-Hr Accumulation (in)', colors: ['#00fb90','#00cc00','#009900','#006600','#ffff00','#ffcc00','#ff9100','#ff0000'], scale: ['0.05"','0.5"','2.0"','8.0"'] }
+                ]
+            },
+            qpe24h: {
+                label: '24-Hr Precip',
+                getImgName:  (i) => `qpe24h_${i}.png`,
+                getMetaName: (i) => `metadata_qpe24h_${i}.json`,
+                legend: [
+                    { label: '24-Hr Accumulation (in)', colors: ['#00fb90','#00cc00','#009900','#006600','#ffff00','#ffcc00','#ff9100','#ff0000'], scale: ['0.25"','2.0"','6.0"','16"'] }
+                ]
+            },
+            lightning: {
+                label: '1-Hr Lightning',
+                getImgName:  (i) => `lightning_${i}.png`,
+                getMetaName: (i) => `metadata_lightning_${i}.json`,
+                legend: [
+                    { label: '1-Hr CG Lightning Prob (%)', colors: ['#ffffb2','#fed976','#feb24c','#fd8d3c','#fc4e2a','#e31a1c','#bd0026','#800026'], scale: ['5%','30%','60%','90%'] }
+                ]
+            },
+            rotation: {
+                label: 'Azimuthal Shear',
+                getImgName:  (i) => `rotation_${i}.png`,
+                getMetaName: (i) => `metadata_rotation_${i}.json`,
+                legend: [
+                    { label: 'Az Shear (s\u207b\u00b9)', colors: ['#00ff00','#80ff00','#ffff00','#ff8000','#ff0000','#c00000','#ff00ff','#8000ff'], scale: ['0.003','0.012','0.030','0.050'] }
+                ]
+            }
+        };
+
+        // --- MAP SETUP ---
+        const TOKEN = 'pk.eyJ1IjoiZ3RnMDExNiIsImEiOiJjbWxsODV6NXAwNThmM2ZwdWlkYm0xNjFlIn0.vI186twXYzY45nnuV5FucQ';
+        mapboxgl.accessToken = TOKEN;
+
+        const MAP_STYLES = {
+            'satellite-streets': 'mapbox://styles/mapbox/satellite-streets-v12',
+            'outdoors': 'mapbox://styles/mapbox/outdoors-v12',
+            'streets': 'mapbox://styles/mapbox/streets-v12'
+        };
+
+        const savedMapType = localStorage.getItem('mrms-map-type') || 'satellite-streets';
+        const savedProduct = localStorage.getItem('mrms-product') || 'rate';
+
+        const map = new mapboxgl.Map({
+            container: 'map',
+            style: MAP_STYLES[savedMapType],
+            center: [-98, 38],
+            zoom: 3.8,
+            projection: 'mercator'
+        });
+
+        const geolocate = new mapboxgl.GeolocateControl({
+            positionOptions: { enableHighAccuracy: true },
+            trackUserLocation: true,
+            showUserHeading: true
+        });
+        map.addControl(geolocate, 'top-right');
+
+        // --- STATE ---
+        let frames = [];
+        let currentIndex = 0;
+        let isPlaying = false;
+        let playTimer = null;
+        let currentProduct = savedProduct;
+
+        // --- LEGEND ---
+        function renderLegend(productKey) {
+            const cfg = PRODUCTS[productKey];
+            const container = document.getElementById('legend-container');
+            container.innerHTML = '';
+            for (const grp of cfg.legend) {
+                const div = document.createElement('div');
+                div.className = 'legend-group';
+
+                const lbl = document.createElement('span');
+                lbl.className = 'legend-label';
+                lbl.textContent = grp.label;
+                div.appendChild(lbl);
+
+                const strip = document.createElement('div');
+                strip.className = 'color-strip';
+                for (const c of grp.colors) {
+                    const blk = document.createElement('div');
+                    blk.className = 'color-block';
+                    blk.style.background = c;
+                    strip.appendChild(blk);
+                }
+                div.appendChild(strip);
+
+                if (grp.scale) {
+                    const scale = document.createElement('div');
+                    scale.className = 'legend-scale';
+                    scale.innerHTML = grp.scale.map(v => `<span>${v}</span>`).join('');
+                    div.appendChild(scale);
+                }
+
+                container.appendChild(div);
+            }
+        }
+
+        // --- DATA LOADING ---
+        async function loadFrames(productKey) {
+            const cfg = PRODUCTS[productKey];
+            const currentPath = window.location.pathname;
+            const baseDataPath = currentPath.includes('/public/') ? 'data' : 'public/data';
+            const loaded = [];
+
+            for (let i = 0; i < 15; i++) {
+                try {
+                    const metaName = cfg.getMetaName(i);
+                    const res = await fetch(`${baseDataPath}/${metaName}?t=${Date.now()}`);
+                    if (!res.ok) continue;
+                    const meta = await res.json();
+                    loaded.push({
+                        url: `${baseDataPath}/${cfg.getImgName(i)}?t=${Date.now()}`,
+                        time: meta.time,
+                        bounds: [meta.bounds[0][1], meta.bounds[0][0], meta.bounds[1][1], meta.bounds[1][0]]
+                    });
+                } catch (e) { /* frame unavailable */ }
+            }
+            return loaded;
+        }
+
+        async function init() {
+            frames = await loadFrames(currentProduct);
+
+            if (frames.length === 0) {
+                document.getElementById('timestamp').innerText = "DATA NOT FOUND";
+                return;
+            }
+
+            frames.reverse();
+            document.getElementById('time-slider').max = frames.length - 1;
+
+            renderLegend(currentProduct);
+
+            if (map.loaded()) setupRadar();
+            else map.on('load', setupRadar);
+        }
+
+        function setupRadar() {
+            // Remove existing radar layer/source if present
+            if (map.getLayer('radar-layer')) map.removeLayer('radar-layer');
+            if (map.getSource('radar-source')) map.removeSource('radar-source');
+
+            const layers = map.getStyle().layers;
+            let firstTopLayerId;
+            for (const layer of layers) {
+                if (layer.id.includes('admin') || layer.id.includes('label') || layer.id.includes('road')) {
+                    firstTopLayerId = layer.id;
+                    break;
+                }
+            }
+
+            const initialFrame = frames[frames.length - 1];
+            map.addSource('radar-source', {
+                type: 'image',
+                url: initialFrame.url,
+                coordinates: [
+                    [initialFrame.bounds[0], initialFrame.bounds[3]],
+                    [initialFrame.bounds[2], initialFrame.bounds[3]],
+                    [initialFrame.bounds[2], initialFrame.bounds[1]],
+                    [initialFrame.bounds[0], initialFrame.bounds[1]]
+                ]
+            });
+
+            map.addLayer({
+                id: 'radar-layer',
+                type: 'raster',
+                source: 'radar-source',
+                paint: {
+                    'raster-opacity': parseFloat(document.getElementById('opacity-slider').value),
+                    'raster-resampling': 'nearest',
+                    'raster-fade-duration': 0
+                }
+            }, firstTopLayerId);
+
+            updateFrame(frames.length - 1);
+        }
+
+        function updateFrame(idx) {
+            currentIndex = parseInt(idx);
+            const frame = frames[currentIndex];
+            if (!frame) return;
+
+            const source = map.getSource('radar-source');
+            if (source) {
+                source.updateImage({
+                    url: frame.url,
+                    coordinates: [
+                        [frame.bounds[0], frame.bounds[3]],
+                        [frame.bounds[2], frame.bounds[3]],
+                        [frame.bounds[2], frame.bounds[1]],
+                        [frame.bounds[0], frame.bounds[1]]
+                    ]
+                });
+            }
+
+            document.getElementById('timestamp').innerText = frame.time;
+            document.getElementById('time-slider').value = currentIndex;
+        }
+
+        // --- PLAYBACK ---
+        function togglePlay() {
+            isPlaying = !isPlaying;
+            document.getElementById('play-btn').innerHTML = isPlaying ? '<i class="fas fa-pause"></i>' : '<i class="fas fa-play"></i>';
+            if (isPlaying) animate();
+            else clearTimeout(playTimer);
+        }
+
+        function animate() {
+            if (!isPlaying) return;
+            currentIndex = (currentIndex + 1) % frames.length;
+            updateFrame(currentIndex);
+            const delay = 1200 - (document.getElementById('speed-slider').value * 110);
+            playTimer = setTimeout(animate, delay);
+        }
+
+        // --- PRODUCT SWITCHING ---
+        async function switchProduct(productKey) {
+            if (!PRODUCTS[productKey]) return;
+            if (isPlaying) togglePlay();
+
+            currentProduct = productKey;
+            localStorage.setItem('mrms-product', productKey);
+            setActiveBtn('[data-product]', `[data-product="${productKey}"]`);
+            renderLegend(productKey);
+
+            document.getElementById('timestamp').innerText = 'LOADING...';
+
+            frames = await loadFrames(productKey);
+            if (frames.length === 0) {
+                document.getElementById('timestamp').innerText = 'DATA NOT FOUND';
+                // Remove radar if no data
+                if (map.getLayer('radar-layer')) map.removeLayer('radar-layer');
+                if (map.getSource('radar-source')) map.removeSource('radar-source');
+                return;
+            }
+            frames.reverse();
+            document.getElementById('time-slider').max = frames.length - 1;
+
+            if (map.loaded()) setupRadar();
+            else map.on('load', setupRadar);
+        }
+
+        // --- MAP TYPE SWITCHING ---
+        function switchMapType(type) {
+            if (!MAP_STYLES[type]) return;
+            localStorage.setItem('mrms-map-type', type);
+            setActiveBtn('[data-maptype]', `[data-maptype="${type}"]`);
+            map.setStyle(MAP_STYLES[type]);
+            map.once('style.load', () => {
+                if (frames.length > 0) setupRadar();
+            });
+        }
+
+        function setActiveBtn(groupSelector, activeSelector) {
+            document.querySelectorAll(groupSelector).forEach(btn => {
+                btn.classList.toggle('active', btn.matches(activeSelector));
+            });
+        }
+
+        // --- EVENT LISTENERS ---
+        document.getElementById('play-btn').onclick = togglePlay;
+        document.getElementById('time-slider').oninput = (e) => {
+            if (isPlaying) togglePlay();
+            updateFrame(e.target.value);
+        };
+        document.getElementById('opacity-slider').oninput = (e) => {
+            if (map.getLayer('radar-layer')) {
+                map.setPaintProperty('radar-layer', 'raster-opacity', parseFloat(e.target.value));
+            }
+        };
+
+        document.querySelectorAll('[data-product]').forEach(btn => {
+            btn.onclick = () => switchProduct(btn.dataset.product);
+        });
+        document.querySelectorAll('[data-maptype]').forEach(btn => {
+            btn.onclick = () => switchMapType(btn.dataset.maptype);
+        });
+
+        // Set initial active states
+        setActiveBtn('[data-product]', `[data-product="${currentProduct}"]`);
+        setActiveBtn('[data-maptype]', `[data-maptype="${savedMapType}"]`);
+
+        init();
+
+        // --- PIXEL INSPECTOR ---
+        const INSPECTABLE = ['mesh', 'qpe6h', 'qpe24h', 'lightning', 'rotation'];
+
+        // max_val must match SINGLE_PRODUCTS[key]['max_val'] in process_mrms.py.
+        // decimals: decimal places for the displayed exact value.
+        const PIXEL_TABLES = {
+            mesh:      { max_val: 8.0,   decimals: 2, unit: 'in',  label: 'Hail Size (MESH)' },
+            qpe6h:     { max_val: 40.0,  decimals: 2, unit: 'in',  label: '6-Hr Precip' },
+            qpe24h:    { max_val: 80.0,  decimals: 2, unit: 'in',  label: '24-Hr Precip' },
+            lightning: { max_val: 100.0, decimals: 0, unit: '%',   label: 'CG Lightning Prob' },
+            rotation:  { max_val: 1.0,   decimals: 4, unit: 's⁻¹', label: 'Az Shear' },
+        };
+
+        function latToMerc(lat) {
+            return Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360));
+        }
+
+        const imgCache = {};
+        let pixelPopup = null;
+
+        async function loadImgToCanvas(url) {
+            if (imgCache[url]) return imgCache[url];
+            const img = await new Promise((res, rej) => {
+                const i = new Image();
+                i.crossOrigin = 'anonymous';
+                i.onload = () => res(i);
+                i.onerror = rej;
+                i.src = url;
+            });
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width; canvas.height = img.height;
+            canvas.getContext('2d').drawImage(img, 0, 0);
+            const keys = Object.keys(imgCache);
+            if (keys.length >= 15) delete imgCache[keys[0]];
+            imgCache[url] = canvas;
+            return canvas;
+        }
+
+        function updateInspectCursor() {
+            const el = map.getCanvas();
+            if (INSPECTABLE.includes(currentProduct)) el.classList.add('map-inspect');
+            else el.classList.remove('map-inspect');
+        }
+
+        async function inspectPixel(lngLat) {
+            if (!INSPECTABLE.includes(currentProduct)) return;
+            const frame = frames[currentIndex];
+            if (!frame) return;
+
+            if (isPlaying) togglePlay();
+
+            // Load the value PNG: {product}_val_{i}.png (R+G encode exact float)
+            const valUrl = frame.url.replace(/(_\d+\.png)(\?.*)?$/, '_val$1');
+            let canvas;
+            try {
+                canvas = await loadImgToCanvas(valUrl);
+            } catch (e) { return; } // val PNG not yet generated for this frame
+
+            // frame.bounds = [lonLeft, latBot, lonRight, latTop]
+            const [lonLeft, latBot, lonRight, latTop] = frame.bounds;
+            const mercTop = latToMerc(latTop);
+            const mercBot = latToMerc(latBot);
+            const mercCli = latToMerc(lngLat.lat);
+
+            const px = Math.round((lngLat.lng - lonLeft) / (lonRight - lonLeft) * canvas.width);
+            const py = Math.round((mercTop - mercCli) / (mercTop - mercBot) * canvas.height);
+
+            if (pixelPopup) { pixelPopup.remove(); pixelPopup = null; }
+            if (px < 0 || px >= canvas.width || py < 0 || py >= canvas.height) return;
+
+            const [r, g, b, a] = canvas.getContext('2d').getImageData(px, py, 1, 1).data;
+            const tbl = PIXEL_TABLES[currentProduct];
+
+            if (a < 15) {
+                pixelPopup = new mapboxgl.Popup({ closeButton: true, className: 'pixel-popup' })
+                    .setLngLat(lngLat)
+                    .setHTML(`<div class="pixel-popup-content"><span class="pixel-label">${tbl.label}</span><span class="pixel-nodata">No Data</span></div>`)
+                    .addTo(map);
+                return;
+            }
+
+            // Decode: val = uint16(R, G) / 65535 * max_val
+            const val = (((r << 8) | g) / 65535) * tbl.max_val;
+            const valText = `${val.toFixed(tbl.decimals)} ${tbl.unit}`;
+
+            pixelPopup = new mapboxgl.Popup({ closeButton: true, className: 'pixel-popup' })
+                .setLngLat(lngLat)
+                .setHTML(`<div class="pixel-popup-content"><span class="pixel-label">${tbl.label}</span><span class="pixel-value">${valText}</span></div>`)
+                .addTo(map);
+        }
+
+        map.on('click', (e) => inspectPixel(e.lngLat));
+
+        // Keep cursor updated when switching products
+        const _origSwitchProduct = switchProduct;
+        // Patch switchProduct to also update cursor and clear popup
+        const _patchedSwitchProduct = async (key) => {
+            if (pixelPopup) { pixelPopup.remove(); pixelPopup = null; }
+            Object.keys(imgCache).forEach(k => delete imgCache[k]);
+            await _origSwitchProduct(key);
+            updateInspectCursor();
+        };
+        document.querySelectorAll('[data-product]').forEach(btn => {
+            btn.onclick = () => _patchedSwitchProduct(btn.dataset.product);
+        });
+
+        map.on('load', updateInspectCursor);
+        setTimeout(updateInspectCursor, 500);
+    </script>
+</body>
+</html>
