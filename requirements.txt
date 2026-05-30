@@ -1,0 +1,8 @@
+xarray
+cfgrib
+numpy
+matplotlib
+requests
+beautifulsoup4
+scipy
+Pillow
