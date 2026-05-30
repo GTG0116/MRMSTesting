@@ -215,9 +215,15 @@ _hrrr_cache = {}  # cache key: YYYYMMDDHH string
 def _fetch_hrrr_vars_s3(date_str, hour_str, hours_back):
     import cfgrib  # noqa: F401
 
+    # CRAIN/CSNOW/CICEP/CFRZR are not present in fhr=00; use fhr>=1.
+    # Using fhr=max(1,hours_back) keeps the valid time close to "now":
+    #   hours_back=0 → fhr=01 (current run, valid ~1h ahead)
+    #   hours_back=1 → fhr=01 (1h-old run, valid exactly now)
+    #   hours_back=2 → fhr=02 (2h-old run, valid exactly now)
+    fhr = max(1, hours_back)
     base_url = (
         f"{HRRR_BUCKET}/hrrr.{date_str}/conus"
-        f"/hrrr.t{hour_str}z.wrfsfcf00.grib2"
+        f"/hrrr.t{hour_str}z.wrfsfcf{fhr:02d}.grib2"
     )
     idx_url = base_url + ".idx"
 
@@ -293,6 +299,10 @@ def get_hrrr_precip_type(target_dt, tgt_lats_2d, tgt_lons_2d):
 
             if hrrr_lat is None or not vmap:
                 continue
+
+            # HRRR GRIB2 stores longitudes in 0-360; normalize to -180/180
+            # to match target_lons (LON_LEFT=-130, LON_RIGHT=-60).
+            hrrr_lon = ((hrrr_lon + 180) % 360) - 180
 
             zero  = np.zeros_like(hrrr_lat)
             crain = vmap.get('crain', zero)
