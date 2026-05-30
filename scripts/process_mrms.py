@@ -310,9 +310,6 @@ def get_hrrr_precip_type(target_dt, tgt_lats_2d, tgt_lons_2d):
             cicep = vmap.get('cicep', zero)
             cfrzr = vmap.get('cfrzr', zero)
 
-            if not (np.any(crain) or np.any(csnow) or np.any(cicep) or np.any(cfrzr)):
-                continue
-
             flat_lons = hrrr_lon.flatten()
             flat_lats = hrrr_lat.flatten()
             tree      = cKDTree(np.column_stack([flat_lons, flat_lats]))
@@ -335,7 +332,10 @@ def get_hrrr_precip_type(target_dt, tgt_lats_2d, tgt_lons_2d):
             if fname and os.path.exists(fname):
                 os.remove(fname)
 
-            print(f"  HRRR precip type (S3): {hour_str}z (t-{hours_back}h)")
+            fhr_used = max(1, hours_back)
+            n_typed = int(np.sum(result['rain'] | result['snow'] | result['ice']))
+            print(f"  HRRR precip type (S3): {hour_str}z fhr={fhr_used:02d} "
+                  f"({n_typed} typed px)")
             _hrrr_cache[cache_key] = result
             return result
 
