@@ -15,7 +15,7 @@ import pytz
 import gc
 
 # --- CONFIGURATION ---
-LAT_TOP, LAT_BOT = 50.0, 24.0
+LAT_TOP, LAT_BOT = 55.0, 20.0
 LON_LEFT, LON_RIGHT = -130.0, -60.0
 OUTPUT_DIR = "public/data"
 NUM_FRAMES = 15
