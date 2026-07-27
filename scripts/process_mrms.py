@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
+from scipy.ndimage import gaussian_filter, maximum_filter
 from datetime import datetime, timezone, timedelta
 import pytz
 import gc
@@ -32,6 +32,21 @@ WINTRY_RATE_MAX = 15.0  # mm/hr (internal threshold, raw data units)
 
 # Unit conversion: all display values are in inches
 MM_TO_IN = 1.0 / 25.4
+
+# --- CONTOUR SMOOTHING ---
+# Every frame is rendered as smoothed filled contours instead of raw pixel
+# blocks: the field is coarsened, Gaussian-smoothed, then drawn with contourf.
+# The contour outlines themselves are hidden (each band's edge is painted the
+# same colour as its fill), so only the smooth colour fill shows.
+#
+# Coarsening takes the block MAXIMUM rather than the mean: averaging a small,
+# intense echo against the empty background drags its peak below the lowest
+# colour bound and the feature disappears entirely.
+SMOOTH_SIGMA      = 1.5  # Gaussian sigma, in coarse-grid cells
+CONTOUR_DOWNSCALE = 2    # block-max factor applied before contouring
+SMOOTH_DILATE     = 1    # max-filter width (coarse cells) applied before blurring;
+                         # >1 keeps speckly fields from being blurred away
+CONTOUR_SEAM_LW   = 0.4  # edge width used to cover hairline seams between bands
 
 # --- SESSION SETUP ---
 session = requests.Session()
@@ -69,18 +84,88 @@ RAIN_COLORS = [
 SNOW_COLORS = ['#00ffff', '#80ffff', '#ffffff', '#adc5ff', '#5a82ff']
 ICE_COLORS  = ['#ff00ff', '#d100d1', '#910091', '#4b0082', '#2d004b']
 
-def get_cmap_norm(p_type):
-    if p_type == 'snow':
-        cmap = ListedColormap(SNOW_COLORS)
-        norm = BoundaryNorm(SNOW_BOUNDS, cmap.N)
-    elif p_type == 'ice':
-        cmap = ListedColormap(ICE_COLORS)
-        norm = BoundaryNorm(ICE_BOUNDS, cmap.N)
-    else:  # rain
-        cmap = ListedColormap(RAIN_COLORS)
-        norm = BoundaryNorm(RAIN_BOUNDS, cmap.N)
-    cmap.set_bad(alpha=0)  # NaN → fully transparent
-    return cmap, norm
+def _smooth_field(vals, floor, sigma=SMOOTH_SIGMA, downscale=CONTOUR_DOWNSCALE,
+                  dilate=SMOOTH_DILATE):
+    """Coarsen and Gaussian-smooth a field so it can be contoured.
+
+    No-data cells (NaN) are replaced with `floor` — a value below the lowest
+    colour bound — so the smoothed field tapers away to nothing at the edge of
+    the echo rather than ending on a hard, blocky boundary.
+
+    Returns (grid, x, y) where x/y are the pixel coordinates of the coarse
+    cell centres on the original full-resolution grid.
+    """
+    grid = np.where(np.isfinite(vals), vals, floor).astype(np.float32)
+
+    d = max(1, int(downscale))
+    if d > 1:
+        h, w   = grid.shape
+        hc, wc = (h // d) * d, (w // d) * d
+        grid   = grid[:hc, :wc].reshape(hc // d, d, wc // d, d).max(axis=(1, 3))
+
+    if dilate > 1:
+        grid = maximum_filter(grid, size=int(dilate))
+
+    if sigma > 0:
+        grid = gaussian_filter(grid, sigma=sigma, mode='nearest')
+
+    x = (np.arange(grid.shape[1]) + 0.5) * d
+    y = (np.arange(grid.shape[0]) + 0.5) * d
+    return grid, x, y
+
+
+def draw_smooth_contours(ax, vals, bounds, colors, width_px, height_px,
+                         sigma=SMOOTH_SIGMA, dilate=SMOOTH_DILATE, min_val=None):
+    """Draw `vals` as smoothed filled contours with the contour lines hidden.
+
+    No-data cells stay transparent; values above bounds[-1] take the top
+    colour, matching the old BoundaryNorm over-colour behaviour.
+
+    `min_val` is the threshold the data was masked at. Below the first bound
+    it adds a sub-threshold sliver in the first colour — what the old
+    under-colour did. Above it, the bands the data can never reach are dropped
+    so the smoothed halo cannot spill into them.
+    """
+    levels      = list(bounds)
+    fill_colors = list(colors)
+    if min_val is not None:
+        i = int(np.searchsorted(levels, min_val, side='right')) - 1
+        if i < 0:
+            levels      = [min_val] + levels
+            fill_colors = [fill_colors[0]] + fill_colors
+        elif 0 < i < len(fill_colors):
+            levels      = [max(min_val, levels[i])] + levels[i + 1:]
+            fill_colors = fill_colors[i:]
+    # contourf with extend='max' needs one colour per region, including the
+    # open-ended top region — reuse the top colour for it.
+    fill_colors = fill_colors + [fill_colors[-1]]
+
+    # Background floor: one full colour band below the lowest level, so the
+    # smoothed halo around an echo drops out quickly instead of spreading the
+    # fill outward. Keyed off the first real band (not the optional min_val
+    # sliver, which can be far too narrow to separate data from background).
+    floor      = levels[0] - (bounds[1] - bounds[0])
+    grid, x, y = _smooth_field(vals, floor, sigma=sigma, dilate=dilate)
+
+    cs = ax.contourf(x, y, grid, levels=levels, colors=fill_colors,
+                     extend='max', antialiased=True)
+
+    # Hide the contours themselves: stroke each band's outline in that band's
+    # own fill colour. The line is therefore invisible, while still covering
+    # the hairline seams antialiasing leaves between neighbouring bands.
+    try:
+        cs.set_edgecolor('face')
+        cs.set_linewidth(CONTOUR_SEAM_LW)
+    except AttributeError:  # matplotlib < 3.8 keeps per-level collections
+        for coll in cs.collections:
+            coll.set_edgecolor('face')
+            coll.set_linewidth(CONTOUR_SEAM_LW)
+
+    # Pixel coordinates, row 0 at the top — same framing imshow produced.
+    ax.set_xlim(0, width_px)
+    ax.set_ylim(height_px, 0)
+    return cs
+
 
 # --- COLOR TABLES: SINGLE-FIELD PRODUCTS ---
 # Each entry: prefix, bounds (N+1 values for N color intervals), colors (N values),
@@ -104,6 +189,8 @@ SINGLE_PRODUCTS = {
         'min_val': 0.20,   # inches (~5 mm)
         'max_val': 8.0,    # inches (~200 mm fill-value cap)
         'conversion': MM_TO_IN,
+        # Hail swaths are narrow — smooth them lightly so they keep their shape.
+        'smooth_sigma': 1.0,
         'label': 'Max Estimated Hail Size (in)',
     },
     'qpe6h': {
@@ -203,6 +290,10 @@ SINGLE_PRODUCTS = {
         'use_abs': True,
         'min_val': 0.002,   # s⁻¹ — below this is noise
         'max_val': 1.0,     # s⁻¹ — generous cap; gross fills stripped earlier (>1e10)
+        # AzShear couplets are only a few pixels across and scattered; dilate
+        # before blurring so the smoothing doesn't erase them.
+        'smooth_sigma': 1.2,
+        'smooth_dilate': 2,
         'label': 'Azimuthal Shear (s\u207b\u00b9)',
     },
 }
@@ -514,19 +605,21 @@ def process_frame(rate_key, flag_keys):
         ax  = fig.add_axes([0, 0, 1, 1], frameon=False)
         ax.set_axis_off()
 
-        extent    = [LON_LEFT, LON_RIGHT, LAT_BOT, LAT_TOP]
-        plot_args = dict(extent=extent, origin='upper', interpolation='none', aspect='auto')
+        # Anything the rate grid called precipitation (>0.1 mm/hr) should show,
+        # including rates just under the first colour bound.
+        rate_floor = 0.1 * MM_TO_IN  # in/hr
 
-        rain_cmap, rain_norm = get_cmap_norm('rain')
-        snow_cmap, snow_norm = get_cmap_norm('snow')
-        ice_cmap,  ice_norm  = get_cmap_norm('ice')
-
+        # Each precip type is contoured separately so the three colour tables
+        # stay independent; snow/ice draw on top of rain where they overlap.
         if np.any(rain > RAIN_BOUNDS[0]):
-            ax.imshow(rain, cmap=rain_cmap, norm=rain_norm, **plot_args)
+            draw_smooth_contours(ax, rain, RAIN_BOUNDS, RAIN_COLORS,
+                                 width_px, height_px, min_val=rate_floor)
         if np.any(snow > SNOW_BOUNDS[0]):
-            ax.imshow(snow, cmap=snow_cmap, norm=snow_norm, **plot_args)
+            draw_smooth_contours(ax, snow, SNOW_BOUNDS, SNOW_COLORS,
+                                 width_px, height_px, min_val=rate_floor)
         if np.any(ice > ICE_BOUNDS[0]):
-            ax.imshow(ice,  cmap=ice_cmap,  norm=ice_norm,  **plot_args)
+            draw_smooth_contours(ax, ice, ICE_BOUNDS, ICE_COLORS,
+                                 width_px, height_px, min_val=rate_floor)
 
         plt.savefig(os.path.join(OUTPUT_DIR, "master.png"), transparent=True, pad_inches=0)
         plt.close()
@@ -670,19 +763,18 @@ def process_single_field_frame(key, product_key, product_cfg):
 
         utc_dt = _parse_valid_time(ds, key)
 
-        cmap = ListedColormap(product_cfg['colors'])
-        norm = BoundaryNorm(product_cfg['bounds'], cmap.N)
-        cmap.set_bad(alpha=0)
-
         fig = plt.figure(figsize=(width_px / 100, height_px / 100), dpi=100)
         ax  = fig.add_axes([0, 0, 1, 1], frameon=False)
         ax.set_axis_off()
 
-        extent    = [LON_LEFT, LON_RIGHT, LAT_BOT, LAT_TOP]
-        plot_args = dict(extent=extent, origin='upper', interpolation='none', aspect='auto')
-
         if n_valid > 0:
-            ax.imshow(vals, cmap=cmap, norm=norm, **plot_args)
+            draw_smooth_contours(
+                ax, vals, product_cfg['bounds'], product_cfg['colors'],
+                width_px, height_px,
+                sigma=product_cfg.get('smooth_sigma', SMOOTH_SIGMA),
+                dilate=product_cfg.get('smooth_dilate', SMOOTH_DILATE),
+                min_val=min_val,
+            )
 
         img_path  = os.path.join(OUTPUT_DIR, f"{product_key}_0.png")
         meta_path = os.path.join(OUTPUT_DIR, f"metadata_{product_key}_0.json")
