@@ -10,7 +10,8 @@ import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
 from contourpy import contour_generator, FillType
-from scipy.ndimage import gaussian_filter, maximum_filter
+from scipy.ndimage import (gaussian_filter, maximum_filter, grey_closing,
+                           binary_fill_holes, binary_opening)
 from datetime import datetime, timezone, timedelta
 import pytz
 import gc
@@ -44,18 +45,29 @@ MM_TO_IN = 1.0 / 25.4
 # Coarsening takes the block MAXIMUM rather than the mean: averaging a small,
 # intense echo against the empty background drags its peak below the lowest
 # colour bound and the feature disappears entirely.
+#
+# Two things keep the bands looking like weather rather than like a mesh of
+# polygons: narrow blank pockets inside an echo are closed before the blur, so
+# a storm doesn't come out riddled with holes next to its core, and every ring
+# is put in a canonical order before it is simplified, so the boundary two
+# neighbouring bands share simplifies to exactly the same points and no gap
+# opens up between them.
 SMOOTH_SIGMA      = 1.5  # Gaussian sigma, in coarse-grid cells
 CONTOUR_DOWNSCALE = 2    # block-max factor applied before contouring
 SMOOTH_DILATE     = 1    # max-filter width (coarse cells) applied before blurring;
                          # >1 keeps speckly fields from being blurred away
+SMOOTH_GAP_FILL   = 4    # close blank pockets up to this many coarse cells wide
+                         # before blurring, so storms don't come out with holes
 
 # GeoJSON output tuning. Simplify tolerance and minimum polygon area are in
 # coarse cells (one coarse cell ≈ 2 km); the contours are already smoothed at
 # a larger scale than that, so simplification costs no visible detail while
 # cutting the payload by ~3x.
-GEOJSON_SIMPLIFY  = 0.25  # Douglas-Peucker tolerance, in coarse cells
+GEOJSON_SIMPLIFY  = 0.75  # Douglas-Peucker tolerance, in coarse cells
 GEOJSON_MIN_AREA  = 1.0   # drop polygons smaller than this many coarse cells²
 GEOJSON_DECIMALS  = 4     # coordinate precision (~11 m)
+GEOJSON_ROUND     = 1     # Chaikin corner-cutting passes over each ring; rounds
+                          # off the facets simplification leaves behind
 
 # --- SESSION SETUP ---
 session = requests.Session()
@@ -93,13 +105,58 @@ RAIN_COLORS = [
 SNOW_COLORS = ['#00ffff', '#80ffff', '#ffffff', '#adc5ff', '#5a82ff']
 ICE_COLORS  = ['#ff00ff', '#d100d1', '#910091', '#4b0082', '#2d004b']
 
-def _smooth_field(vals, floor, sigma=SMOOTH_SIGMA, downscale=CONTOUR_DOWNSCALE,
-                  dilate=SMOOTH_DILATE):
+def _disc(width):
+    """Boolean disc footprint `width` cells across (round, not square)."""
+    r = (width - 1) / 2.0
+    o = np.arange(width) - r
+    return np.hypot(o[:, None], o[None, :]) <= r + 0.25
+
+
+def _fill_gaps(grid, threshold, width):
+    """Close narrow blank pockets sitting inside an echo.
+
+    MRMS drops out in patches inside storms — beam blockage, the cone of
+    silence right over a radar, cells the rate algorithm zeroes out, pixels
+    this layer's type mask handed to one of the other two layers. Those
+    patches sit below the lowest colour bound, survive the blur, and the
+    contours punch a blank hole through the storm — often right beside its
+    most intense part, where the eye is least willing to accept it.
+
+    Only cells that are blank (below `threshold`), enclosed by the echo, and
+    part of a pocket narrower than `width` cells are touched; they take the
+    value of a grey-scale closing, i.e. of the data that surrounds them.
+    Everything else — the intensity structure of the storm, the outer edge of
+    the echo, and wide gaps that are genuinely precipitation-free — is left
+    exactly as it was.
+    """
+    if width < 2:
+        return grid
+
+    blank = grid < threshold
+    if not blank.any():
+        return grid
+
+    disc     = _disc(int(width))
+    enclosed = binary_fill_holes(~blank)          # the echo and what it surrounds
+    narrow   = blank & ~binary_opening(blank, structure=disc)
+    pockets  = enclosed & narrow
+    if not pockets.any():
+        return grid
+
+    return np.where(pockets, grey_closing(grid, footprint=disc, mode='nearest'),
+                    grid)
+
+
+def _smooth_field(vals, floor, gap_below=None, sigma=SMOOTH_SIGMA,
+                  downscale=CONTOUR_DOWNSCALE, dilate=SMOOTH_DILATE,
+                  gap_fill=SMOOTH_GAP_FILL):
     """Coarsen and Gaussian-smooth a field so it can be contoured.
 
     No-data cells (NaN) are replaced with `floor` — a value below the lowest
     colour bound — so the smoothed field tapers away to nothing at the edge of
-    the echo rather than ending on a hard, blocky boundary.
+    the echo rather than ending on a hard, blocky boundary. No-data pockets
+    *inside* an echo are then closed up (see `_fill_gaps`) so they don't turn
+    into holes in the middle of a storm.
 
     Returns (grid, x, y) where x/y are the pixel coordinates of the coarse
     cell centres on the original full-resolution grid.
@@ -114,6 +171,9 @@ def _smooth_field(vals, floor, sigma=SMOOTH_SIGMA, downscale=CONTOUR_DOWNSCALE,
 
     if dilate > 1:
         grid = maximum_filter(grid, size=int(dilate))
+
+    if gap_below is not None:
+        grid = _fill_gaps(grid, gap_below, gap_fill)
 
     if sigma > 0:
         grid = gaussian_filter(grid, sigma=sigma, mode='nearest')
@@ -147,6 +207,57 @@ def _contour_levels(bounds, colors, min_val=None):
     return levels, fill_colors + [fill_colors[-1]]
 
 
+def _ring_area(ring):
+    """Absolute area of a closed ring, in the ring's own units."""
+    rx, ry = ring[:, 0], ring[:, 1]
+    return 0.5 * abs(np.dot(rx, np.roll(ry, 1)) - np.dot(ry, np.roll(rx, 1)))
+
+
+def _canonical_ring(ring):
+    """Rewrite a closed ring in a canonical form: no repeated end point, wound
+    counter-clockwise, starting at its lowest-leftmost vertex.
+
+    Neighbouring bands share their boundaries — the curve that closes one band
+    is the very same curve that opens the next — but contourpy hands the two
+    copies back with different start vertices and opposite windings.
+    Simplifying them as given picks different vertices to keep, and the sliver
+    between the two versions shows through as a blank hairline, most visibly
+    where the bands crowd together around an intense core. Canonicalising
+    first makes both copies simplify to identical points, so the bands tile
+    exactly.
+    """
+    pts = ring[:-1] if np.array_equal(ring[0], ring[-1]) else ring
+    if len(pts) < 3:
+        return pts
+    signed = (np.dot(pts[:, 0], np.roll(pts[:, 1], -1)) -
+              np.dot(pts[:, 1], np.roll(pts[:, 0], -1)))
+    if signed < 0:
+        pts = pts[::-1]
+    start = int(np.lexsort((pts[:, 1], pts[:, 0]))[0])
+    return np.roll(pts, -start, axis=0)
+
+
+def _round_ring(ring, passes=GEOJSON_ROUND):
+    """Chaikin corner cutting on a closed ring.
+
+    Simplification leaves long straight facets that read as a polygon rather
+    than a weather feature; each pass replaces every corner with two points a
+    quarter of the way along its edges, which rounds the outline off without
+    moving it more than a fraction of a cell. The cut is symmetric, so a ring
+    and its reverse round identically and shared band boundaries stay matched.
+    """
+    pts = ring[:-1]
+    for _ in range(int(passes)):
+        if len(pts) < 3:
+            break
+        nxt = np.roll(pts, -1, axis=0)
+        cut = np.empty((len(pts) * 2, 2), dtype=pts.dtype)
+        cut[0::2] = 0.75 * pts + 0.25 * nxt
+        cut[1::2] = 0.25 * pts + 0.75 * nxt
+        pts = cut
+    return np.vstack([pts, pts[:1]])
+
+
 def _simplify_ring(points, tol):
     """Douglas-Peucker simplification of an (N, 2) ring, iteratively."""
     n = len(points)
@@ -176,6 +287,27 @@ def _simplify_ring(points, tol):
     return points[keep]
 
 
+def _clean_ring(ring, tol, min_area):
+    """Canonicalise, simplify and round one contour ring.
+
+    Returns the finished closed ring, or None if it is too small to keep. The
+    decision and the result depend only on the ring's geometry, never on how
+    contourpy happened to hand it over, so the two bands that share a boundary
+    always make the same call about it.
+    """
+    if len(ring) < 4 or _ring_area(ring) < min_area:
+        return None
+    pts = _canonical_ring(ring)
+    if len(pts) < 3:
+        return None
+    closed = np.vstack([pts, pts[:1]])
+    closed = _simplify_ring(closed, tol)
+    if len(closed) < 4:
+        return None
+    closed[-1] = closed[0]  # simplification must not break closure
+    return _round_ring(closed)
+
+
 def contour_features(vals, bounds, colors, width_px, height_px,
                      sigma=SMOOTH_SIGMA, dilate=SMOOTH_DILATE, min_val=None):
     """Trace `vals` into smoothed filled contour bands as GeoJSON features.
@@ -190,7 +322,8 @@ def contour_features(vals, bounds, colors, width_px, height_px,
     # fill outward. Keyed off the first real band (not the optional min_val
     # sliver, which can be far too narrow to separate data from background).
     floor      = levels[0] - (bounds[1] - bounds[0])
-    grid, x, y = _smooth_field(vals, floor, sigma=sigma, dilate=dilate)
+    grid, x, y = _smooth_field(vals, floor, gap_below=levels[0],
+                               sigma=sigma, dilate=dilate)
 
     # Contour coordinates come back in full-resolution pixel space; convert to
     # lon/lat. Rows are evenly spaced in Mercator Y, so the inverse Mercator
@@ -216,18 +349,15 @@ def contour_features(vals, bounds, colors, width_px, height_px,
             for p in range(len(outer) - 1):
                 rings = []
                 for r in range(outer[p], outer[p + 1]):
-                    ring = pts[offsets[r]:offsets[r + 1]]
-                    if len(ring) < 4:
+                    ring = _clean_ring(pts[offsets[r]:offsets[r + 1]],
+                                       tol, min_area)
+                    if ring is None:
+                        # A dropped exterior takes its holes with it: keeping
+                        # them would promote a hole to the polygon's outline.
+                        if r == outer[p]:
+                            rings = []
+                            break
                         continue
-                    rx, ry = ring[:, 0], ring[:, 1]
-                    area   = 0.5 * abs(np.dot(rx, np.roll(ry, 1)) -
-                                       np.dot(ry, np.roll(rx, 1)))
-                    if area < min_area:
-                        continue
-                    ring = _simplify_ring(ring, tol)
-                    if len(ring) < 4:
-                        continue
-                    ring[-1] = ring[0]  # simplification must not break closure
                     lon = LON_LEFT + ring[:, 0] / width_px * (LON_RIGHT - LON_LEFT)
                     lat = merc_to_lat(
                         merc_top - ring[:, 1] / height_px * (merc_top - merc_bot))
