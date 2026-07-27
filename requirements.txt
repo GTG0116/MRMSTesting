@@ -2,6 +2,7 @@ xarray
 cfgrib
 numpy
 matplotlib
+contourpy
 requests
 beautifulsoup4
 scipy

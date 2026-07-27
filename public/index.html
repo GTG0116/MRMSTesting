@@ -160,7 +160,7 @@
         const PRODUCTS = {
             rate: {
                 label: 'Precip Rate',
-                getImgName:  (i) => i === 0 ? 'master.png' : `master_${i}.png`,
+                getDataName: (i) => i === 0 ? 'master.geojson' : `master_${i}.geojson`,
                 getMetaName: (i) => `metadata_${i}.json`,
                 legend: [
                     { label: 'Rain (in/hr)',  colors: ['#00fb90','#00cc00','#009900','#006600','#ffff00','#ffcc00','#ff9100','#ff5500','#ff0000','#cc0000'], scale: ['0.01"','0.20"','1.0"','5.0"'] },
@@ -170,7 +170,7 @@
             },
             refl: {
                 label: 'Base Reflectivity',
-                getImgName:  (i) => `refl_${i}.png`,
+                getDataName: (i) => `refl_${i}.geojson`,
                 getMetaName: (i) => `metadata_refl_${i}.json`,
                 legend: [
                     { label: 'Reflectivity (dBZ)', colors: ['#646464','#04e9e7','#019ff4','#0300f4','#02fd02','#01c501','#008e00','#fdf802','#e5bc00','#fd9500','#fd0000','#d40000','#bc0000','#f800fd'], scale: ['0','35','55','75'] }
@@ -178,7 +178,7 @@
             },
             mesh: {
                 label: 'Hail Size (MESH)',
-                getImgName:  (i) => `mesh_${i}.png`,
+                getDataName: (i) => `mesh_${i}.geojson`,
                 getMetaName: (i) => `metadata_mesh_${i}.json`,
                 legend: [
                     { label: 'Hail Diameter (in)', colors: ['#c8f500','#ffff00','#ffd700','#ff8c00','#ff4500','#ff0000','#cc0000','#7f0000'], scale: ['0.25" Pea','0.75"','1.75" Golf','3.0" Baseball'] }
@@ -186,7 +186,7 @@
             },
             qpe6h: {
                 label: '6-Hr Precip',
-                getImgName:  (i) => `qpe6h_${i}.png`,
+                getDataName: (i) => `qpe6h_${i}.geojson`,
                 getMetaName: (i) => `metadata_qpe6h_${i}.json`,
                 legend: [
                     { label: '6-Hr Accumulation (in)', colors: ['#00fb90','#00cc00','#009900','#006600','#ffff00','#ffcc00','#ff9100','#ff0000'], scale: ['0.05"','0.5"','2.0"','8.0"'] }
@@ -194,7 +194,7 @@
             },
             qpe24h: {
                 label: '24-Hr Precip',
-                getImgName:  (i) => `qpe24h_${i}.png`,
+                getDataName: (i) => `qpe24h_${i}.geojson`,
                 getMetaName: (i) => `metadata_qpe24h_${i}.json`,
                 legend: [
                     { label: '24-Hr Accumulation (in)', colors: ['#00fb90','#00cc00','#009900','#006600','#ffff00','#ffcc00','#ff9100','#ff0000'], scale: ['0.25"','2.0"','6.0"','16"'] }
@@ -202,7 +202,7 @@
             },
             lightning: {
                 label: '1-Hr Lightning',
-                getImgName:  (i) => `lightning_${i}.png`,
+                getDataName: (i) => `lightning_${i}.geojson`,
                 getMetaName: (i) => `metadata_lightning_${i}.json`,
                 legend: [
                     { label: '1-Hr CG Lightning Prob (%)', colors: ['#ffffb2','#fed976','#feb24c','#fd8d3c','#fc4e2a','#e31a1c','#bd0026','#800026'], scale: ['5%','30%','60%','90%'] }
@@ -210,7 +210,7 @@
             },
             rotation: {
                 label: 'Azimuthal Shear',
-                getImgName:  (i) => `rotation_${i}.png`,
+                getDataName: (i) => `rotation_${i}.geojson`,
                 getMetaName: (i) => `metadata_rotation_${i}.json`,
                 legend: [
                     { label: 'Az Shear (s\u207b\u00b9)', colors: ['#00ff00','#80ff00','#ffff00','#ff8000','#ff0000','#c00000','#ff00ff','#8000ff'], scale: ['0.003','0.012','0.030','0.050'] }
@@ -252,6 +252,9 @@
         let isPlaying = false;
         let playTimer = null;
         let currentProduct = savedProduct;
+        // Bumped whenever the displayed product changes, so in-flight frame
+        // loads from the previous product can tell they are stale and bail out.
+        let loadToken = 0;
 
         // --- LEGEND ---
         function renderLegend(productKey) {
@@ -289,6 +292,10 @@
         }
 
         // --- DATA LOADING ---
+        // One cache-buster per page load: frame data is refetched when the page
+        // is opened, but flipping between frames reuses the browser cache.
+        const LOAD_TAG = Date.now();
+
         async function loadFrames(productKey) {
             const cfg = PRODUCTS[productKey];
             const currentPath = window.location.pathname;
@@ -298,17 +305,34 @@
             for (let i = 0; i < 15; i++) {
                 try {
                     const metaName = cfg.getMetaName(i);
-                    const res = await fetch(`${baseDataPath}/${metaName}?t=${Date.now()}`);
+                    const res = await fetch(`${baseDataPath}/${metaName}?t=${LOAD_TAG}`);
                     if (!res.ok) continue;
                     const meta = await res.json();
                     loaded.push({
-                        url: `${baseDataPath}/${cfg.getImgName(i)}?t=${Date.now()}`,
+                        url: `${baseDataPath}/${cfg.getDataName(i)}?t=${LOAD_TAG}`,
+                        valUrl: `${baseDataPath}/${productKey}_val_${i}.png?t=${LOAD_TAG}`,
                         time: meta.time,
                         bounds: [meta.bounds[0][1], meta.bounds[0][0], meta.bounds[1][1], meta.bounds[1][0]]
                     });
                 } catch (e) { /* frame unavailable */ }
             }
             return loaded;
+        }
+
+        // --- CONTOUR DATA ---
+        // Frames are handed to the map as URLs: Mapbox fetches and parses them
+        // off the main thread and keeps only the tiles it needs, so stepping
+        // through frames never builds up parsed GeoJSON in page memory.
+        const EMPTY_FC = { type: 'FeatureCollection', features: [] };
+
+        // Warm the browser cache before playback so the animation doesn't stall
+        // on the network. One at a time, to stay out of the map's way.
+        async function prefetchFrames() {
+            const token = loadToken;
+            for (const frame of frames) {
+                if (token !== loadToken) return;
+                try { await fetch(frame.url, { cache: 'force-cache' }); } catch (e) { /* skip */ }
+            }
         }
 
         async function init() {
@@ -342,29 +366,22 @@
                 }
             }
 
-            const initialFrame = frames[frames.length - 1];
-            map.addSource('radar-source', {
-                type: 'image',
-                url: initialFrame.url,
-                coordinates: [
-                    [initialFrame.bounds[0], initialFrame.bounds[3]],
-                    [initialFrame.bounds[2], initialFrame.bounds[3]],
-                    [initialFrame.bounds[2], initialFrame.bounds[1]],
-                    [initialFrame.bounds[0], initialFrame.bounds[1]]
-                ]
-            });
+            // Contour bands are vector polygons, so they stay smooth at every
+            // zoom level instead of resolving into image pixels.
+            map.addSource('radar-source', { type: 'geojson', data: EMPTY_FC });
 
             map.addLayer({
                 id: 'radar-layer',
-                type: 'raster',
+                type: 'fill',
                 source: 'radar-source',
                 paint: {
-                    'raster-opacity': parseFloat(document.getElementById('opacity-slider').value),
-                    'raster-resampling': 'nearest',
-                    'raster-fade-duration': 0
+                    'fill-color': ['get', 'c'],
+                    'fill-opacity': parseFloat(document.getElementById('opacity-slider').value),
+                    'fill-antialias': true
                 }
             }, firstTopLayerId);
 
+            loadToken++;
             updateFrame(frames.length - 1);
         }
 
@@ -373,28 +390,18 @@
             const frame = frames[currentIndex];
             if (!frame) return;
 
-            const source = map.getSource('radar-source');
-            if (source) {
-                source.updateImage({
-                    url: frame.url,
-                    coordinates: [
-                        [frame.bounds[0], frame.bounds[3]],
-                        [frame.bounds[2], frame.bounds[3]],
-                        [frame.bounds[2], frame.bounds[1]],
-                        [frame.bounds[0], frame.bounds[1]]
-                    ]
-                });
-            }
-
             document.getElementById('timestamp').innerText = frame.time;
             document.getElementById('time-slider').value = currentIndex;
+
+            const source = map.getSource('radar-source');
+            if (source) source.setData(frame.url);
         }
 
         // --- PLAYBACK ---
         function togglePlay() {
             isPlaying = !isPlaying;
             document.getElementById('play-btn').innerHTML = isPlaying ? '<i class="fas fa-pause"></i>' : '<i class="fas fa-play"></i>';
-            if (isPlaying) animate();
+            if (isPlaying) { prefetchFrames(); animate(); }
             else clearTimeout(playTimer);
         }
 
@@ -412,6 +419,7 @@
             if (isPlaying) togglePlay();
 
             currentProduct = productKey;
+            loadToken++;  // in-flight prefetches for the old product bail out
             localStorage.setItem('mrms-product', productKey);
             setActiveBtn('[data-product]', `[data-product="${productKey}"]`);
             renderLegend(productKey);
@@ -458,7 +466,7 @@
         };
         document.getElementById('opacity-slider').oninput = (e) => {
             if (map.getLayer('radar-layer')) {
-                map.setPaintProperty('radar-layer', 'raster-opacity', parseFloat(e.target.value));
+                map.setPaintProperty('radar-layer', 'fill-opacity', parseFloat(e.target.value));
             }
         };
 
@@ -527,7 +535,7 @@
             if (isPlaying) togglePlay();
 
             // Load the value PNG: {product}_val_{i}.png (R+G encode exact float)
-            const valUrl = frame.url.replace(/(_\d+\.png)(\?.*)?$/, '_val$1');
+            const valUrl = frame.valUrl;
             let canvas;
             try {
                 canvas = await loadImgToCanvas(valUrl);
